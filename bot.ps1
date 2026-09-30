@@ -369,7 +369,8 @@ while ($true) {
     }
     
     try {
-        $url = "$ApiUrl/getUpdates?offset=$($LastUpdateId + 1)&limit=5"
+        $offset = $LastUpdateId + 1
+        $url = "$ApiUrl/getUpdates?offset=$offset" + "&limit=5"
         $res = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 20
         
         if ($res.ok -and $res.result.Count -gt 0) {
