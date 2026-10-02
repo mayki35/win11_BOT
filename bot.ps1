@@ -595,10 +595,17 @@ function Bot-BuclePrincipal {
                         if ($null -ne $up.update_id) {
                             $Script:BotConfig.LastUpdateId = [long]$up.update_id
                         }
-
                         $msg = $up.message
-                        if ($null -ne $msg -and [string]$msg.from.id -eq [string]$Script:ChatId) {
+                        
+                        # DEBUG: Descomenta la siguiente línea para diagnosticar IDs
+                        # Write-Log ('DEBUG - msg.chat.id: ' + $msg.chat.id + ' | msg.from.id: ' + $msg.from.id + ' | Script ChatId: ' + $Script:ChatId)
+                        
+                        # CORRECCIÓN: Verificar chat.id en lugar de from.id
+                        if ($null -ne $msg -and [string]$msg.chat.id -eq [string]$Script:ChatId) {
                             Procesar-Mensaje -mensaje $msg -chatId ([string]$msg.chat.id)
+                        }
+                        else {
+                            Write-Log ('Mensaje ignorado - Chat ID recibido: ' + $msg.chat.id + ' | Esperado: ' + $Script:ChatId)
                         }
                     }
                     catch {
